@@ -59,8 +59,9 @@ func normalizeTitle(s string) string {
 	if s == "" {
 		return s
 	}
-	// 去掉中英文括号包裹的内容
-	bracketRe := regexp.MustCompile(`[\(（\[【][^\)）\]】]*[\)）\]】]`)
+	// 去掉中英文括号及花括号包裹的内容
+	s = StripProviderTags(s)
+	bracketRe := regexp.MustCompile(`[\(（\[【\{][^\)）\]】\}]*[\)）\]】\}]`)
 	s = bracketRe.ReplaceAllString(s, " ")
 	// 去掉常见噪声词
 	s = noiseTokenRegexp.ReplaceAllString(s, " ")
@@ -240,6 +241,12 @@ func parseVideoFileName(fileName string) parsedVideoTitle {
 		}
 	}
 
+	// 0) 剥离 [tmdbid=...] / {tmdb-...} / [imdbid=...] / {edition-...} 以及 Emby 多版本后缀（" - 1080p" / " - 4K" / " - Director's Cut"）
+	fileName = StripProviderTags(fileName)
+	if base, ver := SplitMovieVersion(fileName, ""); ver != "" && base != "" {
+		fileName = base
+	}
+
 	// 1) 先把开头的序号 "01 "、"1."、"169." 去掉，避免它们污染英文标题
 	//    仅在能明确判定为序号的场景才剥离，避免误伤 "30.Days..."、"300.斯巴达勇士" 这类数字作为片名一部分的情况
 	fileName = stripLeadingSerial(fileName)
@@ -249,10 +256,10 @@ func parseVideoFileName(fileName string) parsedVideoTitle {
 	bracketChinese := extractBracketChinese(fileName)
 
 	// 3) 提取括号中的年份（如 "钢铁侠3 (2013).mkv"），把年份替换到括号外
-	bracketYearRe := regexp.MustCompile(`[\(（\[【]\s*((?:19|20)\d{2})\s*[\)）\]】]`)
+	bracketYearRe := regexp.MustCompile(`[\(（\[【\{]\s*((?:19|20)\d{2})\s*[\)）\]】\}]`)
 	fileName = bracketYearRe.ReplaceAllString(fileName, " $1 ")
 	// 4) 再把剩余括号块替换成空格（其中的中文标题已在第 2 步保存到 bracketChinese）
-	bracketRe := regexp.MustCompile(`[\(（\[【][^\)）\]】]*[\)）\]】]`)
+	bracketRe := regexp.MustCompile(`[\(（\[【\{][^\)）\]】\}]*[\)）\]】\}]`)
 	fileName = bracketRe.ReplaceAllString(fileName, " ")
 
 	// 把多种分隔符统一成 "."，方便后续按 "." 解析
@@ -525,7 +532,9 @@ type tmdbSearchResult struct {
 type tmdbMovieDetail struct {
 	ID               int     `json:"id"`
 	Title            string  `json:"title"`
+	OriginalTitle    string  `json:"original_title"`
 	Name             string  `json:"name"`
+	OriginalName     string  `json:"original_name"`
 	Overview         string  `json:"overview"`
 	PosterPath       string  `json:"poster_path"`
 	ReleaseDate      string  `json:"release_date"`
@@ -545,6 +554,15 @@ type tmdbMovieDetail struct {
 			Name string `json:"name"`
 		} `json:"cast"`
 	} `json:"credits"`
+}
+
+type tmdbFindResponse struct {
+	MovieResults []struct {
+		ID int `json:"id"`
+	} `json:"movie_results"`
+	TVResults []struct {
+		ID int `json:"id"`
+	} `json:"tv_results"`
 }
 
 // durationSeconds 从 TMDB 详情中提取时长（分钟 -> 秒），同时兼容电影 runtime 与剧集 episode_run_time / last_episode_to_air
@@ -1134,15 +1152,21 @@ func extractCandidates(parsed parsedVideoTitle, bracketChinese []string) []Title
 //     - 其它 → 丢弃
 //  4. 全部尝试完仍无强命中 → 返回最佳兜底；都没有则报错
 //
-// 端点选择：根据原始文件名启发式（含 SxxExx/季/集 -> tv，否则 movie），不再 movie/tv 互打
-func (s *TMDBScraper) searchWithFallback(parsed parsedVideoTitle, rawFileName string, bracketChinese []string) (*tmdbSearchResult, error) {
+// 端点选择：优先遵循扫描路径已标记的 VideoType（movie/tv），否则根据原始文件名启发式判断
+func (s *TMDBScraper) searchWithFallback(parsed parsedVideoTitle, rawFileName string, bracketChinese []string, preferredEndpoint ...string) (*tmdbSearchResult, error) {
 	candidates := extractCandidates(parsed, bracketChinese)
 	// 按 Confidence 倒序，置信度高的先尝试
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].Confidence > candidates[j].Confidence
 	})
 
-	endpoint := pickEndpoint(rawFileName)
+	endpoint := ""
+	if len(preferredEndpoint) > 0 {
+		endpoint = preferredEndpoint[0]
+	}
+	if endpoint != "movie" && endpoint != "tv" {
+		endpoint = pickEndpoint(rawFileName)
+	}
 
 	// Debug 输出所有待尝试的候选
 	log.Debugf("[TMDB] 候选生成 endpoint=%s year=%q candidates(%d):", endpoint, parsed.Year, len(candidates))
@@ -1350,6 +1374,167 @@ func recordNoMatch(attempts int64, elapsed time.Duration) {
 	atomic.AddInt64(&globalTMDBStats.TotalSearchMillis, elapsed.Milliseconds())
 }
 
+// fetchTMDBDetail 按指定类型（movie / tv）和数字 ID 请求 TMDB 详情，仅在 HTTP 200 且返回有效 ID 时成功。
+func (s *TMDBScraper) fetchTMDBDetail(mediaType string, id int) (*tmdbMovieDetail, error) {
+	detailURL := fmt.Sprintf("%s/%s/%d?api_key=%s&language=%s&append_to_response=credits",
+		s.BaseURL, mediaType, id, s.APIKey, url.QueryEscape(ScrapeLanguage()))
+	log.Debugf("[TMDB] 详情请求: %s", maskAPIKey(detailURL))
+
+	detailResp, err := s.client.Get(detailURL)
+	if err != nil {
+		return nil, fmt.Errorf("TMDB详情请求失败: %w", err)
+	}
+	defer detailResp.Body.Close()
+
+	detailBody, _ := io.ReadAll(detailResp.Body)
+	if detailResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("TMDB详情状态码异常 status=%d", detailResp.StatusCode)
+	}
+	var detail tmdbMovieDetail
+	if err := json.Unmarshal(detailBody, &detail); err != nil {
+		return nil, fmt.Errorf("TMDB详情解析失败: %w", err)
+	}
+	if detail.ID <= 0 {
+		return nil, fmt.Errorf("TMDB详情未返回有效ID")
+	}
+	return &detail, nil
+}
+
+// detailTitleMatchScore 计算文件名解析出的标题与 TMDB 详情（含原片名/译名）的最佳匹配度，
+// 用于在未显式指定 movie/tv 且同一个数字 ID 在 movie 与 tv 下同时存在时消歧。
+func detailTitleMatchScore(parsed parsedVideoTitle, detail *tmdbMovieDetail) float32 {
+	if detail == nil {
+		return 0
+	}
+	var queries []string
+	if parsed.ChineseTitle != "" {
+		queries = append(queries, parsed.ChineseTitle)
+	}
+	if parsed.EnglishTitle != "" {
+		queries = append(queries, parsed.EnglishTitle)
+		if kw := extractEnglishKeywords(parsed.EnglishTitle); kw != "" && kw != parsed.EnglishTitle {
+			queries = append(queries, kw)
+		}
+	}
+	targets := []string{detail.Title, detail.OriginalTitle, detail.Name, detail.OriginalName}
+	var best float32
+	for _, q := range queries {
+		qNorm := strings.ReplaceAll(q, "&", " and ")
+		for _, t := range targets {
+			if t == "" {
+				continue
+			}
+			tNorm := strings.ReplaceAll(t, "&", " and ")
+			if sim := titleSimilarity(qNorm, tNorm); sim > best {
+				best = sim
+			}
+			if kwT := extractEnglishKeywords(tNorm); kwT != "" {
+				if sim := titleSimilarity(qNorm, kwT); sim > best {
+					best = sim
+				}
+			}
+		}
+	}
+	if parsed.Year != "" {
+		rel := detail.ReleaseDate
+		if rel == "" {
+			rel = detail.FirstAirDate
+		}
+		if len(rel) >= 4 && rel[:4] == parsed.Year && best > 0 {
+			best += 0.15
+		}
+	}
+	return best
+}
+
+func preferredEndpointForItem(item *model.MediaItem) (endpoint string, explicit bool) {
+	if item != nil {
+		switch item.VideoType {
+		case "tv":
+			return "tv", true
+		case "movie":
+			return "movie", true
+		}
+		if tvHintRe.MatchString(item.FileName) || tvHintRe.MatchString(item.FolderPath) || tvHintRe.MatchString(item.Episodes) {
+			return "tv", false
+		}
+	}
+	return "movie", false
+}
+
+// resolveByProviderIDs 根据显式命名标签（[tmdbid=...] / [imdbid=...]）直查 TMDB 详情，绕过模糊搜索。
+func (s *TMDBScraper) resolveByProviderIDs(ids ProviderIDs, item *model.MediaItem, parsed parsedVideoTitle) (*tmdbMovieDetail, string, error) {
+	primaryType, explicitType := preferredEndpointForItem(item)
+	secondaryType := "tv"
+	if primaryType == "tv" {
+		secondaryType = "movie"
+	}
+
+	if ids.TmdbID != "" {
+		var tmdbID int
+		fmt.Sscanf(ids.TmdbID, "%d", &tmdbID)
+		if tmdbID > 0 {
+			priDetail, priErr := s.fetchTMDBDetail(primaryType, tmdbID)
+			if priErr != nil {
+				secDetail, secErr := s.fetchTMDBDetail(secondaryType, tmdbID)
+				if secErr == nil {
+					return secDetail, secondaryType, nil
+				}
+				return nil, "", priErr
+			}
+			// 若未显式锁定 movie/tv 且解析出了片名，而首选类型的标题毫不相干（TMDB 的 movie 与 tv 共用数字 ID 空间），
+			// 再探测另一类型并择优采用。
+			hasTitleHint := parsed.ChineseTitle != "" || parsed.EnglishTitle != ""
+			if !explicitType && hasTitleHint {
+				priScore := detailTitleMatchScore(parsed, priDetail)
+				if priScore < 0.70 {
+					if secDetail, secErr := s.fetchTMDBDetail(secondaryType, tmdbID); secErr == nil {
+						if secScore := detailTitleMatchScore(parsed, secDetail); secScore > priScore && secScore >= 0.70 {
+							return secDetail, secondaryType, nil
+						}
+					}
+				}
+			}
+			return priDetail, primaryType, nil
+		}
+	}
+
+	if ids.ImdbID != "" {
+		findURL := fmt.Sprintf("%s/find/%s?api_key=%s&external_source=imdb_id&language=%s",
+			s.BaseURL, url.PathEscape(ids.ImdbID), s.APIKey, url.QueryEscape(ScrapeLanguage()))
+		log.Debugf("[TMDB] IMDb反查请求: %s", maskAPIKey(findURL))
+		resp, err := s.client.Get(findURL)
+		if err != nil {
+			return nil, "", fmt.Errorf("TMDB IMDb反查失败: %w", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, "", fmt.Errorf("TMDB IMDb反查状态码异常 status=%d", resp.StatusCode)
+		}
+		var found tmdbFindResponse
+		if err := json.Unmarshal(body, &found); err != nil {
+			return nil, "", fmt.Errorf("TMDB IMDb反查解析失败: %w", err)
+		}
+		tryOrder := []string{primaryType, secondaryType}
+		for _, mt := range tryOrder {
+			if mt == "movie" && len(found.MovieResults) > 0 {
+				if det, err := s.fetchTMDBDetail("movie", found.MovieResults[0].ID); err == nil {
+					return det, "movie", nil
+				}
+			}
+			if mt == "tv" && len(found.TVResults) > 0 {
+				if det, err := s.fetchTMDBDetail("tv", found.TVResults[0].ID); err == nil {
+					return det, "tv", nil
+				}
+			}
+		}
+		return nil, "", fmt.Errorf("TMDB未找到IMDb条目: %s", ids.ImdbID)
+	}
+
+	return nil, "", fmt.Errorf("无可用外部ID")
+}
+
 // ScrapeVideo 刮削视频信息
 func (s *TMDBScraper) ScrapeVideo(item *model.MediaItem) error {
 	if s.APIKey == "" {
@@ -1358,42 +1543,81 @@ func (s *TMDBScraper) ScrapeVideo(item *model.MediaItem) error {
 
 	atomic.AddInt64(&globalTMDBStats.TotalScraped, 1)
 
-	// 始终从文件名中解析出标题和年份（ScrapedName 是刮削结果字段，不作为搜索输入）
+	// 始终从文件名中解析出标题和年份；若文件名仅含版本词（如 "/Movies/Inception (2010)/1080p.mkv"），回退解析父目录名
 	parsed := parseVideoFileName(item.FileName)
-	// 在剥离括号前再次抽一次方括号中文，作为最高置信度候选源
-	bracketChinese := extractBracketChinese(item.FileName)
-	log.Debugf("[TMDB] 开始刮削 file=%q parsed={chinese=%q english=%q year=%q extras=%v bracket=%v} baseURL=%s",
-		item.FileName, parsed.ChineseTitle, parsed.EnglishTitle, parsed.Year, parsed.ExtraChineseTitles, bracketChinese, s.BaseURL)
-
-	// 搜索策略：中文标题优先，英文标题兜底，都搜不到才失败
-	searchResult, err := s.searchWithFallback(parsed, item.FileName, bracketChinese)
-	if err != nil {
-		log.Debugf("[TMDB] ❌ 刮削失败 file=%q err=%v", item.FileName, err)
-		return err
+	bracketChinese := extractBracketChinese(StripProviderTags(item.FileName))
+	if parsed.ChineseTitle == "" && parsed.EnglishTitle == "" && item.FolderPath != "" && item.FolderPath != "/" {
+		parentBase := stdpath.Base(strings.TrimSuffix(item.FolderPath, "/"))
+		parsed = parseVideoFileName(parentBase)
+		if len(bracketChinese) == 0 {
+			bracketChinese = extractBracketChinese(StripProviderTags(parentBase))
+		}
 	}
 
-	// 取第一个结果
-	first := searchResult.Results[0]
-	mediaType := first.MediaType
-	if mediaType == "" {
-		mediaType = "movie"
+	providerIDs := ExtractProviderIDsFromItem(item)
+	prefEndpoint, _ := preferredEndpointForItem(item)
+
+	log.Debugf("[TMDB] 开始刮削 file=%q provider=%+v parsed={chinese=%q english=%q year=%q extras=%v bracket=%v} baseURL=%s",
+		item.FileName, providerIDs, parsed.ChineseTitle, parsed.EnglishTitle, parsed.Year, parsed.ExtraChineseTitles, bracketChinese, s.BaseURL)
+
+	var detail *tmdbMovieDetail
+	var mediaType string
+	var fallbackTitle string
+	var fallbackReleaseDate string
+
+	if providerIDs.TmdbID != "" || providerIDs.ImdbID != "" {
+		d, mt, err := s.resolveByProviderIDs(providerIDs, item, parsed)
+		if err == nil && d != nil {
+			detail = d
+			mediaType = mt
+			recordHit(1, 0)
+		} else {
+			log.Warnf("[TMDB] 显式标签直查失败 file=%q provider=%+v err=%v，回退标题搜索", item.FileName, providerIDs, err)
+		}
 	}
 
-	// 获取详情（语言跟随「首选刮削语言」设置）
-	detailURL := fmt.Sprintf("%s/%s/%d?api_key=%s&language=%s&append_to_response=credits",
-		s.BaseURL, mediaType, first.ID, s.APIKey, url.QueryEscape(ScrapeLanguage()))
-	log.Debugf("[TMDB] 详情请求: %s", maskAPIKey(detailURL))
+	if detail == nil {
+		// 搜索策略：中文标题优先，英文标题兜底，都搜不到才失败
+		searchResult, err := s.searchWithFallback(parsed, item.FileName, bracketChinese, prefEndpoint)
+		if err != nil {
+			log.Debugf("[TMDB] ❌ 刮削失败 file=%q err=%v", item.FileName, err)
+			return err
+		}
 
-	detailResp, err := s.client.Get(detailURL)
-	if err != nil {
-		return fmt.Errorf("TMDB详情请求失败: %w", err)
+		first := searchResult.Results[0]
+		mediaType = first.MediaType
+		if mediaType == "" {
+			mediaType = prefEndpoint
+		}
+		fallbackTitle = first.Title
+		if fallbackTitle == "" {
+			fallbackTitle = first.Name
+		}
+		fallbackReleaseDate = first.ReleaseDate
+		if fallbackReleaseDate == "" {
+			fallbackReleaseDate = first.FirstAirDate
+		}
+
+		d, err := s.fetchTMDBDetail(mediaType, first.ID)
+		if err != nil {
+			return err
+		}
+		detail = d
 	}
-	defer detailResp.Body.Close()
 
-	detailBody, _ := io.ReadAll(detailResp.Body)
-	var detail tmdbMovieDetail
-	if err := json.Unmarshal(detailBody, &detail); err != nil {
-		return fmt.Errorf("TMDB详情解析失败: %w", err)
+	targetExternalID := fmt.Sprintf("tmdb:%d", detail.ID)
+	// 若路径中带有显式 [tmdbid=...] / [imdbid=...] 标签，且此前曾因未识别标签而错刮到了其它 TMDB 条目，
+	// 自动清空旧的错刮元数据以便用正确的详情覆盖。
+	if providerIDs.FromTag && item.ExternalID != "" && item.ExternalID != targetExternalID {
+		item.ScrapedName = ""
+		item.Plot = ""
+		item.Rating = 0
+		item.ExternalID = ""
+		item.ReleaseDate = ""
+		item.Duration = 0
+		item.Genre = ""
+		item.Authors = ""
+		item.Cover = ""
 	}
 
 	// 填充字段（仅填空字段，已有值不覆盖；ScrapedAt 由调用方统一设置）
@@ -1402,15 +1626,17 @@ func (s *TMDBScraper) ScrapeVideo(item *model.MediaItem) error {
 		title = detail.Name
 	}
 	if title == "" {
-		title = first.Name
+		title = fallbackTitle
 	}
 	// ScrapedName 处理：
 	//   - 扫描阶段会把「去扩展名的文件名」作为默认占位写入 ScrapedName，
-	//     这种占位值应该被刮削得到的真实标题覆盖；
+	//     这种占位值（或剥离命名标签/多版本后缀后的同源占位值）应该被刮削得到的真实标题覆盖；
 	//   - 用户手动编辑过的 ScrapedName 不会等于该占位值，保留不覆盖。
 	if title != "" {
 		defaultName := strings.TrimSuffix(item.FileName, stdpath.Ext(item.FileName))
-		if item.ScrapedName == "" || item.ScrapedName == defaultName {
+		cleanDefault := StripProviderTags(defaultName)
+		baseDefault, _ := SplitMovieVersion(item.FileName, item.FolderPath)
+		if item.ScrapedName == "" || item.ScrapedName == defaultName || item.ScrapedName == cleanDefault || item.ScrapedName == baseDefault {
 			item.ScrapedName = title
 		}
 	}
@@ -1421,7 +1647,7 @@ func (s *TMDBScraper) ScrapeVideo(item *model.MediaItem) error {
 		item.Rating = detail.VoteAverage
 	}
 	if item.ExternalID == "" {
-		item.ExternalID = fmt.Sprintf("tmdb:%d", detail.ID)
+		item.ExternalID = targetExternalID
 	}
 	if item.VideoType == "" {
 		item.VideoType = mediaType
@@ -1432,7 +1658,7 @@ func (s *TMDBScraper) ScrapeVideo(item *model.MediaItem) error {
 		releaseDate = detail.FirstAirDate
 	}
 	if releaseDate == "" {
-		releaseDate = first.FirstAirDate
+		releaseDate = fallbackReleaseDate
 	}
 	if item.ReleaseDate == "" {
 		item.ReleaseDate = releaseDate
@@ -1473,8 +1699,8 @@ func (s *TMDBScraper) ScrapeVideo(item *model.MediaItem) error {
 	item.ScrapedAt = &now
 	hitTitle := title
 	hitYear := ""
-	if len(detail.ReleaseDate) >= 4 {
-		hitYear = detail.ReleaseDate[:4]
+	if len(releaseDate) >= 4 {
+		hitYear = releaseDate[:4]
 	}
 	log.Debugf("[TMDB] ✅ 刮削完成 file=%q -> tmdb_id=%d, title=%q, year=%s, mediaType=%s",
 		item.FileName, detail.ID, hitTitle, hitYear, mediaType)
