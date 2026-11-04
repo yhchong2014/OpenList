@@ -61,6 +61,9 @@ func GetUsers(pageIndex, pageSize int) (users []model.User, count int64, err err
 }
 
 func DeleteUserById(id uint) error {
+	if db.Migrator().HasTable(&model.MediaUserData{}) {
+		_ = ClearMediaUserDataByUser(id)
+	}
 	return errors.WithStack(db.Delete(&model.User{}, id).Error)
 }
 

@@ -398,6 +398,7 @@ type embyPlaybackBody struct {
 	ItemId        string `json:"ItemId"`
 	ItemID        string `json:"ItemID"`
 	PositionTicks int64  `json:"PositionTicks"`
+	RunTimeTicks  int64  `json:"RunTimeTicks"`
 	PlayMethod    string `json:"PlayMethod"`
 	EventName     string `json:"EventName"`
 	MediaSourceId string `json:"MediaSourceId"`
@@ -408,6 +409,26 @@ func (b embyPlaybackBody) itemID() string {
 		return b.ItemId
 	}
 	return b.ItemID
+}
+
+func embyExtractPlaybackMetrics(body embyPlaybackBody, c *gin.Context) (position int64, hasPosition bool, runtimeTicks int64) {
+	if body.PositionTicks > 0 {
+		position = body.PositionTicks
+		hasPosition = true
+	} else if rawPos, ok := c.GetQuery("PositionTicks"); ok && strings.TrimSpace(rawPos) != "" {
+		if v, err := strconv.ParseInt(strings.TrimSpace(rawPos), 10, 64); err == nil {
+			position = v
+			hasPosition = true
+		}
+	}
+	if body.RunTimeTicks > 0 {
+		runtimeTicks = body.RunTimeTicks
+	} else if rawRun, ok := c.GetQuery("RunTimeTicks"); ok && strings.TrimSpace(rawRun) != "" {
+		if v, err := strconv.ParseInt(strings.TrimSpace(rawRun), 10, 64); err == nil && v > 0 {
+			runtimeTicks = v
+		}
+	}
+	return position, hasPosition, runtimeTicks
 }
 
 func embySessionPlaying(c *gin.Context, user *model.User, action string) {
@@ -432,18 +453,8 @@ func embySessionPlaying(c *gin.Context, user *model.User, action string) {
 		c.Status(204)
 		return
 	}
-	position := body.PositionTicks
-	if position == 0 {
-		if v, err := strconv.ParseInt(c.DefaultQuery("PositionTicks", "0"), 10, 64); err == nil {
-			position = v
-		}
-	}
-	played := false
-	if stopped && target.Duration > 0 {
-		ratio := float64(position) / float64(embyTicks(target.Duration))
-		played = ratio >= 0.9
-	}
-	applyProgress(user, target, position, played, stopped)
+	position, hasPosition, runtimeTicks := embyExtractPlaybackMetrics(body, c)
+	applyProgressWithRuntime(user, target, position, hasPosition, runtimeTicks, stopped)
 	c.Status(204)
 }
 
@@ -456,16 +467,9 @@ func embySaveProgress(c *gin.Context, user *model.User, id string, start bool) {
 		c.Status(204)
 		return
 	}
-	position := body.PositionTicks
-	if position == 0 {
-		position, _ = strconv.ParseInt(c.DefaultQuery("PositionTicks", "0"), 10, 64)
-	}
-	played := false
 	stopped := c.Request.Method == "DELETE"
-	if stopped && target.Duration > 0 {
-		played = float64(position)/float64(embyTicks(target.Duration)) >= 0.9
-	}
-	applyProgress(user, target, position, played, stopped)
+	position, hasPosition, runtimeTicks := embyExtractPlaybackMetrics(body, c)
+	applyProgressWithRuntime(user, target, position, hasPosition, runtimeTicks, stopped)
 	c.Status(204)
 }
 
@@ -483,6 +487,64 @@ func applyProgress(user *model.User, target *embyPlayTarget, position int64, pla
 		d.PositionTicks = 0
 		d.PlayCount++
 	}
+	now := time.Now()
+	d.LastPlayedAt = &now
+	_ = db.SaveMediaUserData(d)
+}
+
+func applyProgressWithRuntime(user *model.User, target *embyPlayTarget, position int64, hasPosition bool, runtimeTicks int64, stopped bool) {
+	if user == nil || target == nil {
+		return
+	}
+	if target.Duration <= 0 && runtimeTicks > 0 {
+		sec := int(runtimeTicks / 10_000_000)
+		if sec > 0 {
+			target.Duration = sec
+			if target.Episode == nil && target.Item != nil && target.Item.Duration == 0 {
+				_ = db.UpdateMediaItemDuration(target.ItemID, sec)
+			}
+		}
+	}
+
+	d, err := db.GetMediaUserData(user.ID, target.ItemID, target.EpisodeNo)
+	if err != nil || d == nil {
+		d = &model.MediaUserData{UserID: user.ID, ItemID: target.ItemID, EpisodeIndex: target.EpisodeNo}
+	}
+
+	durationTicks := embyTicks(target.Duration)
+	if durationTicks <= 0 && runtimeTicks > 0 {
+		durationTicks = runtimeTicks
+	}
+
+	effectivePos := position
+	if stopped && effectivePos == 0 && d.PositionTicks > 0 {
+		effectivePos = d.PositionTicks
+	}
+
+	reachedEnd := durationTicks > 0 && effectivePos > 0 && float64(effectivePos)/float64(durationTicks) >= 0.9
+
+	if stopped {
+		if reachedEnd {
+			if !d.Played {
+				d.PlayCount++
+			}
+			d.Played = true
+			d.PositionTicks = 0
+		} else if d.Played && !hasPosition {
+			d.PositionTicks = 0
+		} else if hasPosition {
+			d.PositionTicks = position
+		}
+	} else {
+		if hasPosition || position > 0 {
+			d.PositionTicks = position
+		}
+		if reachedEnd && !d.Played {
+			d.Played = true
+			d.PlayCount++
+		}
+	}
+
 	now := time.Now()
 	d.LastPlayedAt = &now
 	_ = db.SaveMediaUserData(d)
@@ -562,7 +624,14 @@ func embyMarkContainerPlayed(c *gin.Context, user *model.User, lib *embyLibrary,
 
 func embySetFavorite(c *gin.Context, user *model.User, id string, fav bool) {
 	lib := loadEmbyLibrary(user)
-	target, ok := lib.playTarget(id)
+	orig := lib.origID(id)
+	target, ok := lib.playTarget(orig)
+	if !ok && strings.HasPrefix(orig, "sr-") {
+		if s := lib.seriesByKey(strings.TrimPrefix(orig, "sr-")); s != nil && len(s.Items) > 0 {
+			target = &embyPlayTarget{Item: &s.Items[0], ItemID: s.Items[0].ID, EpisodeNo: 0}
+			ok = true
+		}
+	}
 	if !ok {
 		embyNotFound(c)
 		return

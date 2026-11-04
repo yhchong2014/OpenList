@@ -83,6 +83,9 @@ func fillMusicFromLocalWith(ctx context.Context, item *model.MediaItem, skipMeta
 		if item.TrackNumber == 0 && tag.TrackNumber > 0 {
 			item.TrackNumber = tag.TrackNumber
 		}
+		if item.Duration == 0 && tag.Duration > 0 {
+			item.Duration = tag.Duration
+		}
 		if item.ReleaseDate == "" && len(tag.Year) >= 4 {
 			item.ReleaseDate = tag.Year[:4] + "-01-01"
 		}

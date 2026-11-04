@@ -239,6 +239,9 @@ func CreateOrUpdateMediaItem(item *model.MediaItem) error {
 		item.ISBN = existing.ISBN
 		item.ExternalID = existing.ExternalID
 	}
+	if item.Duration == 0 && existing.Duration > 0 {
+		item.Duration = existing.Duration
+	}
 	// 扫描只在类型标签能判定时才写 video_type；标签为空（未配置或被移除）时保留原值，
 	// 否则每次重扫都会把 TMDB 刮削出的 movie/tv 清空，Emby 里的电影/剧集分类跟着翻转。
 	if item.VideoType == "" {
@@ -277,17 +280,44 @@ func UpdateMediaItems(items []model.MediaItem) error {
 	})
 }
 
-// DeleteMediaItem 硬删除媒体条目（真正从数据库删除），并清理该条目的批注
+// UpdateMediaItemDuration 在条目尚未记录时长时回填秒数（使用 UpdateColumn，不改动 updated_at，避免影响 Subsonic Starred）
+func UpdateMediaItemDuration(id uint, duration int) error {
+	if id == 0 || duration <= 0 {
+		return nil
+	}
+	return db.Model(&model.MediaItem{}).
+		Where("id = ? AND duration = 0", id).
+		UpdateColumn("duration", duration).Error
+}
+
+func deleteMediaItemExtras(tx *gorm.DB, ids []uint) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if tx.Migrator().HasTable(&model.MediaAnnotation{}) {
+		if err := tx.Where("item_id IN ?", ids).Delete(&model.MediaAnnotation{}).Error; err != nil {
+			return err
+		}
+	}
+	if tx.Migrator().HasTable(&model.MediaUserData{}) {
+		if err := tx.Where("item_id IN ?", ids).Delete(&model.MediaUserData{}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteMediaItem 硬删除媒体条目（真正从数据库删除），并清理该条目的批注与播放状态
 func DeleteMediaItem(id uint) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Unscoped().Delete(&model.MediaItem{}, id).Error; err != nil {
 			return err
 		}
-		return tx.Where("item_id = ?", id).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaItemExtras(tx, []uint{id})
 	})
 }
 
-// DeleteMediaItemByPath 按 folder_path + file_name 硬删除媒体条目，并清理对应批注。
+// DeleteMediaItemByPath 按 folder_path + file_name 硬删除媒体条目，并清理对应批注与播放状态。
 // 用于清理扫描规则调整后遗留的重复条目（例如旧版本把「第一季」「第二季」各自
 // 入库，现在统一并入剧名目录，那些季条目就成了重复记录）。
 // 返回被删除的条目数。
@@ -305,7 +335,7 @@ func DeleteMediaItemByPath(folderPath, fileName string) (int64, error) {
 		if err := tx.Unscoped().Where("id IN ?", ids).Delete(&model.MediaItem{}).Error; err != nil {
 			return err
 		}
-		return tx.Where("item_id IN ?", ids).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaItemExtras(tx, ids)
 	})
 	if err != nil {
 		return 0, err
@@ -313,7 +343,7 @@ func DeleteMediaItemByPath(folderPath, fileName string) (int64, error) {
 	return int64(len(ids)), nil
 }
 
-// ClearMediaItems 硬删除指定类型的所有媒体条目（真正从数据库删除），并清理对应批注
+// ClearMediaItems 硬删除指定类型的所有媒体条目（真正从数据库删除），并清理对应批注与播放状态
 func ClearMediaItems(mediaType model.MediaType) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		ids := []uint{}
@@ -325,14 +355,11 @@ func ClearMediaItems(mediaType model.MediaType) error {
 			Delete(&model.MediaItem{}).Error; err != nil {
 			return err
 		}
-		if len(ids) == 0 {
-			return nil
-		}
-		return tx.Where("item_id IN ?", ids).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaItemExtras(tx, ids)
 	})
 }
 
-// ClearMediaItemsByScanPath 硬删除指定扫描路径的所有媒体条目，并清理对应批注
+// ClearMediaItemsByScanPath 硬删除指定扫描路径的所有媒体条目，并清理对应批注与播放状态
 func ClearMediaItemsByScanPath(scanPathID uint) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		ids := []uint{}
@@ -344,10 +371,7 @@ func ClearMediaItemsByScanPath(scanPathID uint) error {
 			Delete(&model.MediaItem{}).Error; err != nil {
 			return err
 		}
-		if len(ids) == 0 {
-			return nil
-		}
-		return tx.Where("item_id IN ?", ids).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaItemExtras(tx, ids)
 	})
 }
 
@@ -393,7 +417,7 @@ func ListAllValidMediaItemsForCheck(mediaType model.MediaType) ([]model.MediaIte
 	return items, err
 }
 
-// DeleteMediaItemsByIDs 按ID列表硬删除媒体条目，并清理对应批注
+// DeleteMediaItemsByIDs 按ID列表硬删除媒体条目，并清理对应批注与播放状态
 func DeleteMediaItemsByIDs(ids []uint) error {
 	if len(ids) == 0 {
 		return nil
@@ -402,7 +426,7 @@ func DeleteMediaItemsByIDs(ids []uint) error {
 		if err := tx.Unscoped().Where("id IN ?", ids).Delete(&model.MediaItem{}).Error; err != nil {
 			return err
 		}
-		return tx.Where("item_id IN ?", ids).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaItemExtras(tx, ids)
 	})
 }
 
@@ -483,7 +507,7 @@ func listAccessibleAlbums(tx *gorm.DB, q MediaItemQuery) ([]AlbumInfo, int64, er
 
 func listAccessibleArtists(tx *gorm.DB, q MediaItemQuery) ([]ArtistInfo, int64, error) {
 	type artistAggregate struct {
-		info ArtistInfo
+		info   ArtistInfo
 		albums map[string]struct{}
 	}
 	groups := make(map[string]*artistAggregate)

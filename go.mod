@@ -57,9 +57,11 @@ require (
 	github.com/jlaffaye/ftp v0.2.4
 	github.com/json-iterator/go v1.1.12
 	github.com/kdomanski/iso9660 v0.4.0
+	github.com/longbridgeapp/opencc v0.3.13
 	github.com/maruel/natural v1.3.0
 	github.com/meilisearch/meilisearch-go v0.32.0
 	github.com/mholt/archives v0.1.5
+	github.com/mozillazg/go-pinyin v0.21.0
 	github.com/natefinch/lumberjack v2.0.0+incompatible
 	github.com/ncw/swift/v2 v2.0.5
 	github.com/pkg/errors v0.9.1
@@ -139,6 +141,8 @@ require (
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/lanrat/extsort v1.4.2 // indirect
+	github.com/liuzl/cedar-go v0.0.0-20170805034717-80a9c64b256d // indirect
+	github.com/liuzl/da v0.0.0-20180704015230-14771aad5b1d // indirect
 	github.com/mikelolasagasti/xz v1.0.1 // indirect
 	github.com/minio/minlz v1.2.0 // indirect
 	github.com/minio/xxml v0.0.3 // indirect
