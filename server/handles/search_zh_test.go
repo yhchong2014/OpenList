@@ -57,6 +57,12 @@ func TestZhSearchMatch(t *testing.T) {
 	}
 }
 
+func newSearchTestCtx(rawURL string) *gin.Context {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, rawURL, nil)
+	return c
+}
+
 func TestFilterEmbyItemsZhSearchMoviesAndSeriesScope(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	items := []*embyItem{
@@ -66,30 +72,24 @@ func TestFilterEmbyItemsZhSearchMoviesAndSeriesScope(t *testing.T) {
 	}
 
 	// Movie 拼音首字母命中
-	w := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(w)
-	c.Request = httptest.NewRequest(http.MethodGet, "/Items?SearchTerm=lldq", nil)
-	got := filterEmbyItems(items, c)
+	got := filterEmbyItems(items, newSearchTestCtx("/Items?SearchTerm=lldq"))
 	if len(got) != 1 || got[0].Name != "流浪地球" {
 		t.Fatalf("SearchTerm=lldq got %+v, want [流浪地球]", got)
 	}
 
 	// Series 拼音带空格查询命中
-	c.Request = httptest.NewRequest(http.MethodGet, "/Items?SearchTerm=chang+an", nil)
-	got = filterEmbyItems(items, c)
+	got = filterEmbyItems(items, newSearchTestCtx("/Items?SearchTerm=chang+an"))
 	if len(got) != 1 || got[0].Name != "长安十二时辰" {
 		t.Fatalf("SearchTerm=chang+an got %+v, want [长安十二时辰]", got)
 	}
 
 	// Audio 仅走普通子串，不触发拼音匹配（范围限定在 Movie + Series），但普通子串仍可用
-	c.Request = httptest.NewRequest(http.MethodGet, "/Items?SearchTerm=llgs", nil)
-	got = filterEmbyItems(items, c)
+	got = filterEmbyItems(items, newSearchTestCtx("/Items?SearchTerm=llgs"))
 	if len(got) != 0 {
 		t.Fatalf("Audio item should not match pinyin query llgs, got %+v", got)
 	}
 
-	c.Request = httptest.NewRequest(http.MethodGet, "/Items?SearchTerm=流浪", nil)
-	got = filterEmbyItems(items, c)
+	got = filterEmbyItems(items, newSearchTestCtx("/Items?SearchTerm=流浪"))
 	if len(got) != 2 {
 		t.Fatalf("Plain substring SearchTerm=流浪 should match Movie and Audio, got len=%d", len(got))
 	}
