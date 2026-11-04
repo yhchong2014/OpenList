@@ -548,7 +548,9 @@ func (l *embyLibrary) albums() []*embyAlbum {
 	for _, k := range order {
 		out = append(out, index[k])
 	}
-	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(pinyinSortName(out[i].Name)) < strings.ToLower(pinyinSortName(out[j].Name))
+	})
 	return out
 }
 
@@ -572,9 +574,11 @@ func (l *embyLibrary) movieItem(it *model.MediaItem) *embyItem {
 	if name == "" {
 		name = strings.TrimSuffix(it.FileName, stdpath.Ext(it.FileName))
 	}
+	sortName := pinyinSortName(name)
 	e := &embyItem{
 		Name:            name,
-		SortName:        name,
+		SortName:        sortName,
+		ForcedSortName:  sortName,
 		ServerId:        embyServerID(),
 		Id:              l.guid(fmt.Sprintf("mv-%d", it.ID)),
 		ParentId:        l.guid("lib-movie"),
@@ -603,10 +607,44 @@ func (l *embyLibrary) movieItem(it *model.MediaItem) *embyItem {
 	return e
 }
 
+func (l *embyLibrary) seriesUserData(s *embySeries) *embyUserData {
+	if l == nil || l.user == nil || s == nil {
+		return &embyUserData{}
+	}
+	eps := l.episodesOf(s.Key, 0)
+	total := len(eps)
+	playedCount := 0
+	for _, ep := range eps {
+		if l.userDataOf(ep.Item.ID, ep.Index).Played {
+			playedCount++
+		}
+	}
+	unplayed := total - playedCount
+	var pct float64
+	if total > 0 {
+		pct = float64(playedCount) * 100.0 / float64(total)
+	}
+	fav := false
+	for i := range s.Items {
+		if l.userDataOf(s.Items[i].ID, 0).IsFavorite {
+			fav = true
+			break
+		}
+	}
+	return &embyUserData{
+		UnplayedItemCount: unplayed,
+		Played:            total > 0 && unplayed == 0,
+		PlayedPercentage:  pct,
+		IsFavorite:        fav,
+	}
+}
+
 func (l *embyLibrary) seriesItem(s *embySeries) *embyItem {
+	sortName := pinyinSortName(s.Name)
 	e := &embyItem{
 		Name:           s.Name,
-		SortName:       s.Name,
+		SortName:       sortName,
+		ForcedSortName: sortName,
 		ServerId:       embyServerID(),
 		Id:             l.guid("sr-" + s.Key),
 		ParentId:       l.guid("lib-tv"),
@@ -619,7 +657,7 @@ func (l *embyLibrary) seriesItem(s *embySeries) *embyItem {
 		LocationType:   "FileSystem",
 		ImageTags:      map[string]string{},
 		ProviderIds:    map[string]string{},
-		UserData:       &embyUserData{},
+		UserData:       l.seriesUserData(s),
 	}
 	if tag := embyImageTag(&s.Items[0]); tag != "" {
 		e.ImageTags["Primary"] = tag
@@ -675,6 +713,10 @@ func (l *embyLibrary) seasonItem(s *embySeries, season int) *embyItem {
 			unplayed++
 		}
 	}
+	var pct float64
+	if len(eps) > 0 {
+		pct = float64(len(eps)-unplayed) * 100.0 / float64(len(eps))
+	}
 	e := &embyItem{
 		Name:         fmt.Sprintf("Season %d", season),
 		SortName:     fmt.Sprintf("Season %02d", season),
@@ -689,7 +731,11 @@ func (l *embyLibrary) seasonItem(s *embySeries, season int) *embyItem {
 		ChildCount:   len(eps),
 		LocationType: "FileSystem",
 		ImageTags:    map[string]string{},
-		UserData:     &embyUserData{UnplayedItemCount: unplayed},
+		UserData: &embyUserData{
+			UnplayedItemCount: unplayed,
+			Played:            len(eps) > 0 && unplayed == 0,
+			PlayedPercentage:  pct,
+		},
 	}
 	if len(s.Items) > 0 {
 		if tag := embyImageTag(&s.Items[0]); tag != "" {
@@ -742,9 +788,11 @@ func (l *embyLibrary) episodeItem(ep *embyEpisode) *embyItem {
 }
 
 func (l *embyLibrary) albumItem(al *embyAlbum) *embyItem {
+	sortName := pinyinSortName(al.Name)
 	e := &embyItem{
 		Name:           al.Name,
-		SortName:       al.Name,
+		SortName:       sortName,
+		ForcedSortName: sortName,
 		ServerId:       embyServerID(),
 		Id:             l.guid("al-" + al.Key),
 		ParentId:       l.guid("lib-music"),
@@ -777,9 +825,11 @@ func (l *embyLibrary) songItem(it *model.MediaItem) *embyItem {
 	artist := albumArtistOf(it)
 	albumKey := albumKeyOf(it)
 	artistKey := artistKeyOf(it)
+	sortName := pinyinSortName(name)
 	e := &embyItem{
 		Name:            name,
-		SortName:        name,
+		SortName:        sortName,
+		ForcedSortName:  sortName,
 		ServerId:        embyServerID(),
 		Id:              l.guid(fmt.Sprintf("so-%d", it.ID)),
 		Type:            "Audio",
@@ -1103,7 +1153,7 @@ func filterEmbyItems(items []*embyItem, c *gin.Context) []*embyItem {
 	include := embySplitCSV(c.Query("IncludeItemTypes"))
 	exclude := embySplitCSV(c.Query("ExcludeItemTypes"))
 	mediaTypes := embySplitCSV(c.Query("MediaTypes"))
-	searchTerm := strings.ToLower(strings.TrimSpace(c.Query("SearchTerm")))
+	searchTerm := strings.TrimSpace(c.Query("SearchTerm"))
 	namePrefix := strings.ToLower(strings.TrimSpace(c.Query("NameStartsWith")))
 	filters := strings.ToLower(c.Query("Filters"))
 	isFolder := c.Query("IsFolder")
@@ -1126,10 +1176,10 @@ func filterEmbyItems(items []*embyItem, c *gin.Context) []*embyItem {
 		if len(idSet) > 0 && !idSet[strings.ToLower(it.Id)] {
 			continue
 		}
-		lname := strings.ToLower(it.Name)
-		if searchTerm != "" && !strings.Contains(lname, searchTerm) {
+		if searchTerm != "" && !embyItemMatchesSearch(it, searchTerm) {
 			continue
 		}
+		lname := strings.ToLower(it.Name)
 		if namePrefix != "" && !strings.HasPrefix(lname, namePrefix) {
 			continue
 		}
@@ -1181,7 +1231,7 @@ func sortEmbyItems(items []*embyItem, sortBy, order string) {
 		case "sortname", "name", "seriessortname":
 			la, lb := strings.ToLower(a.SortName), strings.ToLower(b.SortName)
 			if strings.EqualFold(key, "seriessortname") {
-				la, lb = strings.ToLower(a.SeriesName), strings.ToLower(b.SeriesName)
+				la, lb = strings.ToLower(pinyinSortName(a.SeriesName)), strings.ToLower(pinyinSortName(b.SeriesName))
 			}
 			switch {
 			case la < lb:
@@ -1730,12 +1780,12 @@ func embyArtists(c *gin.Context, user *model.User, albumOnly bool) {
 
 func embySearchHints(c *gin.Context, user *model.User) {
 	lib := loadEmbyLibrary(user)
-	term := strings.ToLower(strings.TrimSpace(c.Query("SearchTerm")))
+	term := strings.TrimSpace(c.Query("SearchTerm"))
 	items := lib.allItems()
 	items = filterEmbyItems(items, c)
 	var hints []gin.H
 	for _, it := range items {
-		if term != "" && !strings.Contains(strings.ToLower(it.Name), term) {
+		if term != "" && !embyItemMatchesSearch(it, term) {
 			continue
 		}
 		hints = append(hints, gin.H{

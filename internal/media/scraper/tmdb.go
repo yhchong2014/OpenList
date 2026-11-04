@@ -521,15 +521,22 @@ type tmdbSearchResult struct {
 	} `json:"results"`
 }
 
-// tmdbMovieDetail TMDB电影详情
+// tmdbMovieDetail TMDB电影/剧集详情
 type tmdbMovieDetail struct {
-	ID          int     `json:"id"`
-	Title       string  `json:"title"`
-	Overview    string  `json:"overview"`
-	PosterPath  string  `json:"poster_path"`
-	ReleaseDate string  `json:"release_date"`
-	VoteAverage float32 `json:"vote_average"`
-	Genres      []struct {
+	ID               int     `json:"id"`
+	Title            string  `json:"title"`
+	Name             string  `json:"name"`
+	Overview         string  `json:"overview"`
+	PosterPath       string  `json:"poster_path"`
+	ReleaseDate      string  `json:"release_date"`
+	FirstAirDate     string  `json:"first_air_date"`
+	VoteAverage      float32 `json:"vote_average"`
+	Runtime          int     `json:"runtime"`
+	EpisodeRunTime   []int   `json:"episode_run_time"`
+	LastEpisodeToAir *struct {
+		Runtime int `json:"runtime"`
+	} `json:"last_episode_to_air"`
+	Genres []struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	} `json:"genres"`
@@ -538,6 +545,22 @@ type tmdbMovieDetail struct {
 			Name string `json:"name"`
 		} `json:"cast"`
 	} `json:"credits"`
+}
+
+// durationSeconds 从 TMDB 详情中提取时长（分钟 -> 秒），同时兼容电影 runtime 与剧集 episode_run_time / last_episode_to_air
+func (d tmdbMovieDetail) durationSeconds() int {
+	if d.Runtime > 0 {
+		return d.Runtime * 60
+	}
+	for _, m := range d.EpisodeRunTime {
+		if m > 0 {
+			return m * 60
+		}
+	}
+	if d.LastEpisodeToAir != nil && d.LastEpisodeToAir.Runtime > 0 {
+		return d.LastEpisodeToAir.Runtime * 60
+	}
+	return 0
 }
 
 // doTMDBSearch 执行一次TMDB搜索请求
@@ -1376,6 +1399,9 @@ func (s *TMDBScraper) ScrapeVideo(item *model.MediaItem) error {
 	// 填充字段（仅填空字段，已有值不覆盖；ScrapedAt 由调用方统一设置）
 	title := detail.Title
 	if title == "" {
+		title = detail.Name
+	}
+	if title == "" {
 		title = first.Name
 	}
 	// ScrapedName 处理：
@@ -1403,10 +1429,18 @@ func (s *TMDBScraper) ScrapeVideo(item *model.MediaItem) error {
 
 	releaseDate := detail.ReleaseDate
 	if releaseDate == "" {
+		releaseDate = detail.FirstAirDate
+	}
+	if releaseDate == "" {
 		releaseDate = first.FirstAirDate
 	}
 	if item.ReleaseDate == "" {
 		item.ReleaseDate = releaseDate
+	}
+	if item.Duration == 0 {
+		if dur := detail.durationSeconds(); dur > 0 {
+			item.Duration = dur
+		}
 	}
 
 	if item.Cover == "" && detail.PosterPath != "" {

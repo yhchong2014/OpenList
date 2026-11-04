@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"os"
+	"os/exec"
 	stdpath "path"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -19,10 +22,13 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/internal/transcode"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
@@ -1048,6 +1054,7 @@ func saveMusicTarget(ctx context.Context, target string, sp *model.MediaScanPath
 		albumArtist := ""
 		trackTitle := strings.TrimSuffix(name, stdpath.Ext(name))
 		trackNumber := 0
+		duration := 0
 		cover := ""
 		releaseDate := ""
 		genre := ""
@@ -1063,6 +1070,7 @@ func saveMusicTarget(ctx context.Context, target string, sp *model.MediaScanPath
 				trackTitle = tag.Title
 			}
 			trackNumber = tag.TrackNumber
+			duration = tag.Duration
 			if tag.Year != "" && len(tag.Year) >= 4 {
 				releaseDate = tag.Year[:4] + "-01-01"
 			}
@@ -1102,6 +1110,7 @@ func saveMusicTarget(ctx context.Context, target string, sp *model.MediaScanPath
 			Genre:       genre,
 			Authors:     authors,
 			TrackNumber: trackNumber,
+			Duration:    duration,
 			Lyrics:      lyrics,
 		}
 
@@ -1252,9 +1261,43 @@ func buildMediaItemFromVFS(ctx context.Context, vfsPath string, sp *model.MediaS
 		// 普通文件：记录大小和 MIME 类型，episodes 为空
 		item.FileSize = obj.GetSize()
 		item.MimeType = mediaMimeType(ext)
+		if sp.MediaType == model.MediaTypeVideo && !SkipFileMetadata() {
+			item.Duration = probeLocalVideoDuration(vfsPath)
+		}
 	}
 
 	return item, nil
+}
+
+// probeLocalVideoDuration 仅在底层存储是本地文件系统且本机存在 ffprobe 时探测视频秒级时长；
+// 远程驱动（如 Teldrive/网盘）直接跳过，避免在扫描阶段发起大量远端流读取请求。
+func probeLocalVideoDuration(vfsPath string) int {
+	storage, actualPath, err := op.GetStorageAndActualPath(vfsPath)
+	if err != nil || storage == nil || storage.Config().Name != "Local" {
+		return 0
+	}
+	rooter, ok := storage.(driver.IRootPath)
+	if !ok {
+		return 0
+	}
+	root := rooter.GetRootPath()
+	if root == "" {
+		return 0
+	}
+	full := filepath.Join(root, actualPath)
+	fi, err := os.Stat(full)
+	if err != nil || fi.IsDir() {
+		return 0
+	}
+	probePath := setting.GetStr(conf.TranscodeFFprobePath, "ffprobe")
+	if _, err := exec.LookPath(probePath); err != nil {
+		return 0
+	}
+	probe, err := transcode.ProbeSource(full)
+	if err != nil || probe.Duration <= 0 {
+		return 0
+	}
+	return int(probe.Duration + 0.5)
 }
 
 // episodeNumRe 匹配文件名开头的数字序号，支持 "1、" "2." "3-" "4 " 等分隔符

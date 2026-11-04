@@ -19,6 +19,7 @@ type MusicTag struct {
 	Album       string // TALB
 	AlbumArtist string // TPE2
 	TrackNumber int    // TRCK
+	Duration    int    // 时长（秒）：来自 FLAC STREAMINFO / ID3 TLEN / Vorbis LENGTH
 	Year        string // TYER / TDRC
 	Genre       string // TCON
 	CoverData   []byte // 封面图片原始字节（APIC / PICTURE）
@@ -120,6 +121,10 @@ func ParseID3v2(r io.Reader) (*MusicTag, error) {
 			case "TYER", "TDRC":
 				if tag.Year == "" {
 					tag.Year = text
+				}
+			case "TLEN":
+				if ms, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64); err == nil && ms > 0 {
+					tag.Duration = int(ms / 1000)
 				}
 			case "TCON":
 				tag.Genre = parseID3Genre(text)
@@ -486,8 +491,9 @@ func ParseFLACVorbisComment(r io.Reader) (*MusicTag, error) {
 		return nil, nil // 不是 FLAC 文件
 	}
 
-	// 遍历 METADATA_BLOCK，找到 VORBIS_COMMENT（类型4）和 PICTURE（类型6）
+	// 遍历 METADATA_BLOCK，读取 STREAMINFO（类型0）、VORBIS_COMMENT（类型4）和 PICTURE（类型6）
 	var tag *MusicTag
+	var streamDuration int
 	for {
 		// 读取块头（4字节：1字节标志+类型 + 3字节长度）
 		blockHeader := make([]byte, 4)
@@ -503,6 +509,26 @@ func ParseFLACVorbisComment(r io.Reader) (*MusicTag, error) {
 			return nil, nil
 		}
 
+		if blockType == 0 && blockLen >= 34 {
+			// STREAMINFO 块：精确提取总采样数与采样率以计算秒级时长
+			data := make([]byte, blockLen)
+			if _, err := io.ReadFull(r, data); err != nil {
+				return nil, nil
+			}
+			sampleRate := (uint32(data[10]) << 12) | (uint32(data[11]) << 4) | (uint32(data[12]) >> 4)
+			totalSamples := (uint64(data[13]&0x0F) << 32) | uint64(binary.BigEndian.Uint32(data[14:18]))
+			if sampleRate > 0 && totalSamples > 0 {
+				streamDuration = int(totalSamples / uint64(sampleRate))
+			}
+			if isLast {
+				if streamDuration > 0 {
+					return &MusicTag{Duration: streamDuration}, nil
+				}
+				return tag, nil
+			}
+			continue
+		}
+
 		if blockType == 4 {
 			// VORBIS_COMMENT 块
 			data := make([]byte, blockLen)
@@ -510,6 +536,9 @@ func ParseFLACVorbisComment(r io.Reader) (*MusicTag, error) {
 				return nil, nil
 			}
 			tag = parseVorbisCommentData(data)
+			if tag.Duration == 0 && streamDuration > 0 {
+				tag.Duration = streamDuration
+			}
 			if isLast {
 				return tag, nil
 			}
@@ -542,16 +571,22 @@ func ParseFLACVorbisComment(r io.Reader) (*MusicTag, error) {
 		}
 	}
 
+	if tag == nil && streamDuration > 0 {
+		tag = &MusicTag{Duration: streamDuration}
+	} else if tag != nil && tag.Duration == 0 && streamDuration > 0 {
+		tag.Duration = streamDuration
+	}
 	return tag, nil
 }
 
 // parseFLACPictureBlock 解析 FLAC PICTURE 元数据块，返回图片字节和 MIME 类型
 // 格式（大端序）：
-//   4字节 picture_type
-//   4字节 mime_length + mime_string
-//   4字节 description_length + description_string
-//   4字节 width, 4字节 height, 4字节 color_depth, 4字节 color_count
-//   4字节 data_length + data
+//
+//	4字节 picture_type
+//	4字节 mime_length + mime_string
+//	4字节 description_length + description_string
+//	4字节 width, 4字节 height, 4字节 color_depth, 4字节 color_count
+//	4字节 data_length + data
 func parseFLACPictureBlock(data []byte) ([]byte, string) {
 	if len(data) < 8 {
 		return nil, ""
@@ -603,9 +638,10 @@ func parseFLACPictureBlock(data []byte) ([]byte, string) {
 
 // parseVorbisCommentData 解析 Vorbis Comment 数据块
 // 格式（小端序）：
-//   4字节 vendor_length + vendor_string
-//   4字节 comment_count
-//   每条注释：4字节长度 + UTF-8字符串（格式 "KEY=VALUE"）
+//
+//	4字节 vendor_length + vendor_string
+//	4字节 comment_count
+//	每条注释：4字节长度 + UTF-8字符串（格式 "KEY=VALUE"）
 func parseVorbisCommentData(data []byte) *MusicTag {
 	tag := &MusicTag{}
 	pos := 0
@@ -672,6 +708,12 @@ func parseVorbisCommentData(data []byte) *MusicTag {
 			}
 		case "GENRE":
 			tag.Genre = value
+		case "LENGTH":
+			if tag.Duration == 0 {
+				if ms, err := strconv.ParseInt(value, 10, 64); err == nil && ms > 0 {
+					tag.Duration = int(ms / 1000)
+				}
+			}
 		case "LYRICS", "UNSYNCEDLYRICS", "UNSYNCED LYRICS", "SYNCEDLYRICS", "SYNCED LYRICS":
 			// FLAC/Vorbis 内嵌歌词字段（不同打标软件使用不同 key，全部兼容）
 			if tag.Lyrics == "" {

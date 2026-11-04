@@ -63,16 +63,16 @@ type discogsSearchResult struct {
 }
 
 type discogsReleaseDetail struct {
-	ID          int    `json:"id"`
-	Title       string `json:"title"`
-	Year        int    `json:"year"`
-	CoverImage  string `json:"cover_image"`
-	Notes       string `json:"notes"`
-	Artists     []struct {
+	ID         int    `json:"id"`
+	Title      string `json:"title"`
+	Year       int    `json:"year"`
+	CoverImage string `json:"cover_image"`
+	Notes      string `json:"notes"`
+	Artists    []struct {
 		Name string `json:"name"`
 	} `json:"artists"`
-	Genres []string `json:"genres"`
-	Styles []string `json:"styles"`
+	Genres    []string `json:"genres"`
+	Styles    []string `json:"styles"`
 	Tracklist []struct {
 		Position string `json:"position"`
 		Title    string `json:"title"`
@@ -313,5 +313,63 @@ func (s *DiscogsScraper) ScrapeMusic(item *model.MediaItem) error {
 
 	now := time.Now()
 	item.ScrapedAt = &now
+	if item.Duration == 0 && !item.IsFolder {
+		item.Duration = matchDiscogsTrackDuration(detail, item)
+	}
 	return nil
+}
+
+func matchDiscogsTrackDuration(detail discogsReleaseDetail, item *model.MediaItem) int {
+	if len(detail.Tracklist) == 0 {
+		return 0
+	}
+	if len(detail.Tracklist) == 1 {
+		return parseDiscogsDuration(detail.Tracklist[0].Duration)
+	}
+	if item.TrackNumber > 0 && item.TrackNumber <= len(detail.Tracklist) {
+		if d := parseDiscogsDuration(detail.Tracklist[item.TrackNumber-1].Duration); d > 0 {
+			return d
+		}
+	}
+	baseTitle := strings.TrimSpace(item.ScrapedName)
+	if baseTitle == "" {
+		baseTitle = item.FileName
+		if idx := strings.LastIndex(baseTitle, "."); idx > 0 {
+			baseTitle = baseTitle[:idx]
+		}
+	}
+	for _, tr := range detail.Tracklist {
+		if tr.Title != "" && strings.EqualFold(strings.TrimSpace(tr.Title), baseTitle) {
+			if d := parseDiscogsDuration(tr.Duration); d > 0 {
+				return d
+			}
+		}
+	}
+	return 0
+}
+
+func parseDiscogsDuration(raw string) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	parts := strings.Split(raw, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0
+	}
+	total := 0
+	for _, p := range parts {
+		n := 0
+		if p == "" {
+			return 0
+		}
+		for _, r := range p {
+			if r < '0' || r > '9' {
+				return 0
+			}
+			n = n*10 + int(r-'0')
+		}
+		total = total*60 + n
+	}
+	return total
 }
