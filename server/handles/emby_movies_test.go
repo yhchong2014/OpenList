@@ -194,7 +194,10 @@ func TestEmbyMultiVersionPlaybackSelectionAndFolderMovie(t *testing.T) {
 
 func TestEmbyMultiVersionUserDataAggregation(t *testing.T) {
 	database := setupMediaReviewTest(t)
-	if err := database.AutoMigrate(&model.MediaItem{}, &model.MediaUserData{}); err != nil {
+	if err := database.AutoMigrate(&model.MediaConfig{}, &model.Meta{}, &model.MediaItem{}, &model.MediaUserData{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&model.MediaConfig{MediaType: model.MediaTypeVideo, Enabled: true}).Error; err != nil {
 		t.Fatal(err)
 	}
 
