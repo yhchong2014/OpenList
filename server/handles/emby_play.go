@@ -23,20 +23,36 @@ import (
 
 // embyPlayTarget 播放目标（条目或某一集）
 type embyPlayTarget struct {
-	Item      *model.MediaItem
-	Episode   *model.EpisodeInfo
-	RawPath   string
-	Container string
-	Size      int64
-	Name      string
-	Duration  int
-	ItemID    uint
-	EpisodeNo int
+	Item       *model.MediaItem
+	Episode    *model.EpisodeInfo
+	MovieGroup *embyMovieGroup
+	RawPath    string
+	Container  string
+	Size       int64
+	Name       string
+	Duration   int
+	ItemID     uint
+	EpisodeNo  int
 }
 
 func (l *embyLibrary) playTarget(id string) (*embyPlayTarget, bool) {
 	id = l.origID(id)
 	switch {
+	case strings.HasPrefix(id, "mvf-"):
+		g := l.movieGroupByOrigID(id)
+		if g == nil {
+			return nil, false
+		}
+		for i := range g.Versions {
+			v := &g.Versions[i]
+			if v.SourceID == id {
+				return &embyPlayTarget{
+					Item: v.Item, Episode: v.Episode, MovieGroup: g,
+					RawPath: v.RawPath, Container: v.Container, Size: v.Size,
+					Name: v.Label, Duration: v.Duration, ItemID: g.Primary.ID,
+				}, true
+			}
+		}
 	case strings.HasPrefix(id, "mv-"):
 		n, err := strconv.ParseUint(strings.TrimPrefix(id, "mv-"), 10, 64)
 		if err != nil {
@@ -45,8 +61,24 @@ func (l *embyLibrary) playTarget(id string) (*embyPlayTarget, bool) {
 		for i := range l.videos {
 			if l.videos[i].ID == uint(n) {
 				it := &l.videos[i]
+				g := l.movieGroupByItemID(it.ID)
+				if it.IsFolder && !isEmbySeriesItem(it) {
+					vers := buildVersionsForMovieItem(it)
+					if len(vers) > 0 {
+						v := vers[0]
+						itemID := it.ID
+						if g != nil {
+							itemID = g.Primary.ID
+						}
+						return &embyPlayTarget{
+							Item: it, Episode: v.Episode, MovieGroup: g,
+							RawPath: v.RawPath, Container: v.Container, Size: v.Size,
+							Name: v.FileName, Duration: v.Duration, ItemID: itemID,
+						}, true
+					}
+				}
 				return &embyPlayTarget{
-					Item: it, RawPath: MediaItemFilePath(it), Container: embyExt(it.FileName),
+					Item: it, MovieGroup: g, RawPath: MediaItemFilePath(it), Container: embyExt(it.FileName),
 					Size: it.FileSize, Name: it.FileName, Duration: it.Duration, ItemID: it.ID,
 				}, true
 			}
@@ -80,6 +112,39 @@ func (l *embyLibrary) playTarget(id string) (*embyPlayTarget, bool) {
 
 // embyPlaybackInfo 返回直连播放信息
 func embyPlaybackInfo(c *gin.Context, lib *embyLibrary, id string) {
+	reqSourceID := strings.TrimSpace(c.Query("MediaSourceId"))
+	if reqSourceID == "" && c.Request.Method == http.MethodPost {
+		var pbReq struct {
+			MediaSourceId string `json:"MediaSourceId"`
+		}
+		_ = c.ShouldBindJSON(&pbReq)
+		reqSourceID = strings.TrimSpace(pbReq.MediaSourceId)
+	}
+
+	orig := lib.origID(id)
+	if g := lib.movieGroupByOrigID(orig); g != nil && len(g.Versions) > 0 {
+		movieGuid := lib.guid(fmt.Sprintf("mv-%d", g.Primary.ID))
+		sources := lib.buildMovieMediaSources(g, movieGuid, common_ApiBase(c), embyRequestToken(c))
+		if reqSourceID != "" {
+			reqOrig := lib.origID(reqSourceID)
+			for i := range sources {
+				if strings.EqualFold(sources[i].Id, reqSourceID) || lib.origID(sources[i].Id) == reqOrig {
+					if i > 0 {
+						chosen := sources[i]
+						copy(sources[1:i+1], sources[0:i])
+						sources[0] = chosen
+					}
+					break
+				}
+			}
+		}
+		c.JSON(200, gin.H{
+			"MediaSources":  sources,
+			"PlaySessionId": fmt.Sprintf("openlist-%d-0", g.Primary.ID),
+		})
+		return
+	}
+
 	target, ok := lib.playTarget(id)
 	if !ok {
 		embyNotFound(c)
@@ -149,7 +214,14 @@ func embyPlaybackInfo(c *gin.Context, lib *embyLibrary, id string) {
 // embyStream 302 到签名直链
 func embyStream(c *gin.Context, user *model.User, id string, isAudio bool) {
 	lib := loadEmbyLibrary(user)
-	target, ok := lib.playTarget(id)
+	var target *embyPlayTarget
+	var ok bool
+	if msID := strings.TrimSpace(c.Query("MediaSourceId")); msID != "" {
+		target, ok = lib.playTarget(msID)
+	}
+	if !ok {
+		target, ok = lib.playTarget(id)
+	}
 	if !ok {
 		embyNotFound(c)
 		return
@@ -187,11 +259,15 @@ func embyImage(c *gin.Context, id string, segs []string, allowAnon bool) {
 	id = lib.origID(id)
 	var mediaItem *model.MediaItem
 	switch {
-	case strings.HasPrefix(id, "mv-"):
-		n, _ := strconv.ParseUint(strings.TrimPrefix(id, "mv-"), 10, 64)
-		for i := range lib.videos {
-			if lib.videos[i].ID == uint(n) {
-				mediaItem = &lib.videos[i]
+	case strings.HasPrefix(id, "mv-") || strings.HasPrefix(id, "mvf-"):
+		if g := lib.movieGroupByOrigID(id); g != nil {
+			mediaItem = g.coverItem()
+		} else if strings.HasPrefix(id, "mv-") {
+			n, _ := strconv.ParseUint(strings.TrimPrefix(id, "mv-"), 10, 64)
+			for i := range lib.videos {
+				if lib.videos[i].ID == uint(n) {
+					mediaItem = &lib.videos[i]
+				}
 			}
 		}
 	case strings.HasPrefix(id, "so-"):
@@ -431,6 +507,59 @@ func embyExtractPlaybackMetrics(body embyPlaybackBody, c *gin.Context) (position
 	return position, hasPosition, runtimeTicks
 }
 
+func resolvePlaybackTarget(lib *embyLibrary, id string, body embyPlaybackBody, c *gin.Context) (*embyPlayTarget, bool) {
+	msID := strings.TrimSpace(body.MediaSourceId)
+	if msID == "" && c != nil {
+		msID = strings.TrimSpace(c.Query("MediaSourceId"))
+	}
+	if msID != "" {
+		if t, ok := lib.playTarget(msID); ok {
+			if t.MovieGroup != nil {
+				t.ItemID = t.MovieGroup.Primary.ID
+			}
+			return t, true
+		}
+	}
+	t, ok := lib.playTarget(id)
+	if ok && t.MovieGroup != nil {
+		t.ItemID = t.MovieGroup.Primary.ID
+	}
+	return t, ok
+}
+
+func syncMovieGroupSiblings(userID uint, target *embyPlayTarget, primary *model.MediaUserData) {
+	if target == nil || target.MovieGroup == nil || primary == nil {
+		return
+	}
+	for i := range target.MovieGroup.Items {
+		sibID := target.MovieGroup.Items[i].ID
+		if sibID == primary.ItemID {
+			continue
+		}
+		sd, err := db.GetMediaUserData(userID, sibID, 0)
+		if err != nil || sd == nil {
+			continue
+		}
+		changed := false
+		if !primary.Played && sd.Played {
+			sd.Played = false
+			sd.PlayCount = 0
+			changed = true
+		}
+		if primary.Played && sd.PositionTicks > 0 {
+			sd.PositionTicks = 0
+			changed = true
+		}
+		if !primary.IsFavorite && sd.IsFavorite {
+			sd.IsFavorite = false
+			changed = true
+		}
+		if changed {
+			_ = db.SaveMediaUserData(sd)
+		}
+	}
+}
+
 func embySessionPlaying(c *gin.Context, user *model.User, action string) {
 	var body embyPlaybackBody
 	_ = c.ShouldBindJSON(&body)
@@ -448,7 +577,7 @@ func embySessionPlaying(c *gin.Context, user *model.User, action string) {
 	}
 	stopped := action == "stopped" || action == "stop"
 	lib := loadEmbyLibrary(user)
-	target, ok := lib.playTarget(id)
+	target, ok := resolvePlaybackTarget(lib, id, body, c)
 	if !ok {
 		c.Status(204)
 		return
@@ -462,7 +591,7 @@ func embySaveProgress(c *gin.Context, user *model.User, id string, start bool) {
 	var body embyPlaybackBody
 	_ = c.ShouldBindJSON(&body)
 	lib := loadEmbyLibrary(user)
-	target, ok := lib.playTarget(id)
+	target, ok := resolvePlaybackTarget(lib, id, body, c)
 	if !ok {
 		c.Status(204)
 		return
@@ -548,6 +677,7 @@ func applyProgressWithRuntime(user *model.User, target *embyPlayTarget, position
 	now := time.Now()
 	d.LastPlayedAt = &now
 	_ = db.SaveMediaUserData(d)
+	syncMovieGroupSiblings(user.ID, target, d)
 }
 
 func embySetPlayed(c *gin.Context, user *model.User, id string, played bool) {
@@ -563,6 +693,9 @@ func embySetPlayed(c *gin.Context, user *model.User, id string, played bool) {
 		embyNotFound(c)
 		return
 	}
+	if target.MovieGroup != nil {
+		target.ItemID = target.MovieGroup.Primary.ID
+	}
 	d, err := db.GetMediaUserData(user.ID, target.ItemID, target.EpisodeNo)
 	if err != nil || d == nil {
 		d = &model.MediaUserData{UserID: user.ID, ItemID: target.ItemID, EpisodeIndex: target.EpisodeNo}
@@ -577,6 +710,7 @@ func embySetPlayed(c *gin.Context, user *model.User, id string, played bool) {
 	now := time.Now()
 	d.LastPlayedAt = &now
 	_ = db.SaveMediaUserData(d)
+	syncMovieGroupSiblings(user.ID, target, d)
 	c.JSON(200, gin.H{
 		"PlaybackPositionTicks": d.PositionTicks,
 		"PlayCount":             d.PlayCount,
@@ -636,12 +770,16 @@ func embySetFavorite(c *gin.Context, user *model.User, id string, fav bool) {
 		embyNotFound(c)
 		return
 	}
+	if target.MovieGroup != nil {
+		target.ItemID = target.MovieGroup.Primary.ID
+	}
 	d, err := db.GetMediaUserData(user.ID, target.ItemID, target.EpisodeNo)
 	if err != nil || d == nil {
 		d = &model.MediaUserData{UserID: user.ID, ItemID: target.ItemID, EpisodeIndex: target.EpisodeNo}
 	}
 	d.IsFavorite = fav
 	_ = db.SaveMediaUserData(d)
+	syncMovieGroupSiblings(user.ID, target, d)
 	c.JSON(200, gin.H{
 		"PlaybackPositionTicks": d.PositionTicks,
 		"PlayCount":             d.PlayCount,
@@ -657,6 +795,9 @@ func embyUpdateUserData(c *gin.Context, user *model.User, id string) {
 	if !ok {
 		embyNotFound(c)
 		return
+	}
+	if target.MovieGroup != nil {
+		target.ItemID = target.MovieGroup.Primary.ID
 	}
 	var body map[string]any
 	_ = c.ShouldBindJSON(&body)
@@ -680,6 +821,7 @@ func embyUpdateUserData(c *gin.Context, user *model.User, id string) {
 		d.PlayCount = int(v)
 	}
 	_ = db.SaveMediaUserData(d)
+	syncMovieGroupSiblings(user.ID, target, d)
 	c.JSON(200, gin.H{
 		"PlaybackPositionTicks": d.PositionTicks,
 		"PlayCount":             d.PlayCount,

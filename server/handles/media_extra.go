@@ -12,6 +12,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/media"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -274,4 +275,51 @@ func GetMediaStrm(c *gin.Context) {
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", url.PathEscape(filename)))
 	c.String(200, content)
+}
+
+// SetMediaDateAddedFollowReleaseAdmin 切换「入库时间跟随发行日期」开关并在开启时全量同步已有条目。
+func SetMediaDateAddedFollowReleaseAdmin(c *gin.Context) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+
+	val := "false"
+	if req.Enabled {
+		val = "true"
+	}
+
+	item, err := op.GetSettingItemByKey(conf.MediaDateAddedFollowRelease)
+	if err != nil || item == nil {
+		item = &model.SettingItem{
+			Key:   conf.MediaDateAddedFollowRelease,
+			Type:  conf.TypeBool,
+			Group: model.MEDIA,
+			Flag:  model.PRIVATE,
+		}
+	}
+	item.Value = val
+
+	db.SetMediaDateAddedFollowRelease(req.Enabled)
+	if err := db.SaveSettingItem(item); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	op.SettingCacheUpdate()
+
+	var synced int64
+	if req.Enabled {
+		synced, err = db.SyncAllMediaCreatedAtToReleaseDate()
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+	}
+	common.SuccessResp(c, gin.H{
+		"enabled": req.Enabled,
+		"synced":  synced,
+	})
 }

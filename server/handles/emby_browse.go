@@ -12,6 +12,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/media"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/gin-gonic/gin"
 )
@@ -26,6 +27,8 @@ type embyLibrary struct {
 	userData map[[2]uint]*model.MediaUserData
 	// ids 保存 GUID -> 内部可读 ID 的映射，客户端只会回传 GUID
 	ids map[string]string
+
+	movieGroupList []*embyMovieGroup
 }
 
 func loadEmbyLibrary(user *model.User) *embyLibrary {
@@ -110,6 +113,11 @@ func (l *embyLibrary) registerIDs() {
 	for i := range l.videos {
 		register(fmt.Sprintf("mv-%d", l.videos[i].ID))
 	}
+	for _, g := range l.movieGroups() {
+		for _, v := range g.Versions {
+			register(v.SourceID)
+		}
+	}
 	for _, s := range l.seriesList() {
 		register("sr-" + s.Key)
 		for _, season := range l.seasonList(s) {
@@ -164,25 +172,25 @@ func isEmbySeriesItem(it *model.MediaItem) bool {
 	case "movie":
 		return false
 	}
+	if isMultiVersionMovieFolder(it) {
+		return false
+	}
 	return it.IsFolder
 }
 
 func seriesKeyOf(item *model.MediaItem) string {
-	name := item.ScrapedName
-	if name == "" {
-		name = strings.TrimSuffix(stdpath.Base(mediaFolderOf(item)), "/")
-	}
+	name := seriesNameOf(item)
 	return embyHash("series:" + strings.ToLower(name))
 }
 
 func seriesNameOf(item *model.MediaItem) string {
 	if item.ScrapedName != "" {
-		return item.ScrapedName
+		return scraper.StripProviderTags(item.ScrapedName)
 	}
 	if item.IsFolder {
-		return strings.TrimSuffix(item.FileName, stdpath.Ext(item.FileName))
+		return scraper.StripProviderTags(strings.TrimSuffix(item.FileName, stdpath.Ext(item.FileName)))
 	}
-	return strings.TrimSuffix(stdpath.Base(mediaFolderOf(item)), "/")
+	return scraper.StripProviderTags(strings.TrimSuffix(stdpath.Base(mediaFolderOf(item)), "/"))
 }
 
 // seriesList 汇总剧集（按剧名去重）
@@ -566,45 +574,16 @@ func (l *embyLibrary) albumByKey(key string) *embyAlbum {
 // ==================== DTO 构造 ====================
 
 func (l *embyLibrary) movieItem(it *model.MediaItem) *embyItem {
-	year := 0
-	if len(it.ReleaseDate) >= 4 {
-		year, _ = strconv.Atoi(it.ReleaseDate[:4])
+	if g := l.movieGroupByItemID(it.ID); g != nil {
+		return l.movieGroupItem(g)
 	}
-	name := it.ScrapedName
-	if name == "" {
-		name = strings.TrimSuffix(it.FileName, stdpath.Ext(it.FileName))
+	g := &embyMovieGroup{
+		Primary:  it,
+		Items:    []model.MediaItem{*it},
+		Versions: buildVersionsForMovieItem(it),
 	}
-	sortName := pinyinSortName(name)
-	e := &embyItem{
-		Name:            name,
-		SortName:        sortName,
-		ForcedSortName:  sortName,
-		ServerId:        embyServerID(),
-		Id:              l.guid(fmt.Sprintf("mv-%d", it.ID)),
-		ParentId:        l.guid("lib-movie"),
-		Type:            "Movie",
-		MediaType:       "Video",
-		IsFolder:        false,
-		Path:            MediaItemFilePath(it),
-		Container:       embyExt(it.FileName),
-		RunTimeTicks:    embyTicks(it.Duration),
-		ProductionYear:  year,
-		Overview:        it.Plot,
-		CommunityRating: it.Rating,
-		PremiereDate:    it.ReleaseDate,
-		DateCreated:     embyTimeStr(it.CreatedAt),
-		UserData:        l.userDataOf(it.ID, 0),
-		ImageTags:       map[string]string{},
-		ProviderIds:     map[string]string{},
-		LocationType:    "FileSystem",
-	}
-	if tag := embyImageTag(it); tag != "" {
-		e.ImageTags["Primary"] = tag
-	}
-	if it.ExternalID != "" {
-		e.ProviderIds["Tmdb"] = it.ExternalID
-	}
-	return e
+	assignMovieVersionLabels(g.Versions)
+	return l.movieGroupItem(g)
 }
 
 func (l *embyLibrary) seriesUserData(s *embySeries) *embyUserData {
@@ -880,14 +859,8 @@ func (l *embyLibrary) songByID(id string) (*model.MediaItem, bool) {
 // ==================== 视图 / 列表 ====================
 
 func (l *embyLibrary) viewItems() []*embyItem {
-	movieCount, seriesCount := 0, 0
-	for i := range l.videos {
-		if isEmbySeriesItem(&l.videos[i]) {
-			continue
-		}
-		movieCount++
-	}
-	seriesCount = len(l.seriesList())
+	movieCount := len(l.movieGroups())
+	seriesCount := len(l.seriesList())
 	albumCount := len(l.albums())
 
 	var out []*embyItem
@@ -992,11 +965,10 @@ func (l *embyLibrary) childrenOf(parentID string) []*embyItem {
 	case parentID == "" || parentID == "root":
 		return l.viewItems()
 	case parentID == "lib-movie":
-		var out []*embyItem
-		for i := range l.videos {
-			if !isEmbySeriesItem(&l.videos[i]) {
-				out = append(out, l.movieItem(&l.videos[i]))
-			}
+		groups := l.movieGroups()
+		out := make([]*embyItem, 0, len(groups))
+		for _, g := range groups {
+			out = append(out, l.movieGroupItem(g))
 		}
 		return out
 	case parentID == "lib-tv":
@@ -1066,11 +1038,8 @@ func (l *embyLibrary) childrenOf(parentID string) []*embyItem {
 // allItems 返回媒体库全部条目（用于搜索/递归）
 func (l *embyLibrary) allItems() []*embyItem {
 	var out []*embyItem
-	for i := range l.videos {
-		if isEmbySeriesItem(&l.videos[i]) {
-			continue
-		}
-		out = append(out, l.movieItem(&l.videos[i]))
+	for _, g := range l.movieGroups() {
+		out = append(out, l.movieGroupItem(g))
 	}
 	for _, s := range l.seriesList() {
 		out = append(out, l.seriesItem(s))
@@ -1113,10 +1082,8 @@ func (l *embyLibrary) allItemsFor(include []string) []*embyItem {
 	want := func(t string) bool { return embyInList(include, t) }
 	var out []*embyItem
 	if want("Movie") {
-		for i := range l.videos {
-			if !isEmbySeriesItem(&l.videos[i]) {
-				out = append(out, l.movieItem(&l.videos[i]))
-			}
+		for _, g := range l.movieGroups() {
+			out = append(out, l.movieGroupItem(g))
 		}
 	}
 	if want("Series") || want("Season") || want("Episode") {
@@ -1415,6 +1382,12 @@ func embyGetItem(c *gin.Context, lib *embyLibrary, id string) {
 		embyNotFound(c)
 		return
 	}
+	if item.Type == "Movie" {
+		if g := lib.movieGroupByOrigID(lib.origID(id)); g != nil {
+			item.MediaSources = lib.buildMovieMediaSources(g, item.Id, common_ApiBase(c), embyRequestToken(c))
+			item.MediaSourceCount = len(item.MediaSources)
+		}
+	}
 	// 有歌词的歌曲在详情里也带上媒体源：客户端歌词面板读取
 	// item.MediaSources[0].DefaultSubtitleStreamIndex 来定位歌词轨
 	if item.Type == "Audio" {
@@ -1439,15 +1412,9 @@ func embyGetItem(c *gin.Context, lib *embyLibrary, id string) {
 func (l *embyLibrary) resolveItem(id string) (*embyItem, bool) {
 	id = l.origID(id)
 	switch {
-	case strings.HasPrefix(id, "mv-"):
-		n, err := strconv.ParseUint(strings.TrimPrefix(id, "mv-"), 10, 64)
-		if err != nil {
-			return nil, false
-		}
-		for i := range l.videos {
-			if l.videos[i].ID == uint(n) {
-				return l.movieItem(&l.videos[i]), true
-			}
+	case strings.HasPrefix(id, "mv-") || strings.HasPrefix(id, "mvf-"):
+		if g := l.movieGroupByOrigID(id); g != nil {
+			return l.movieGroupItem(g), true
 		}
 	case strings.HasPrefix(id, "so-"):
 		if it, ok := l.songByID(id); ok {
@@ -1568,15 +1535,12 @@ func embyLatest(c *gin.Context, lib *embyLibrary) {
 	}
 	var items []*embyItem
 	if MediaTypeEnabled(model.MediaTypeVideo) {
-		var movies []model.MediaItem
-		for i := range lib.videos {
-			if !isEmbySeriesItem(&lib.videos[i]) {
-				movies = append(movies, lib.videos[i])
-			}
-		}
-		sort.Slice(movies, func(i, j int) bool { return movies[i].CreatedAt.After(movies[j].CreatedAt) })
-		for i := range movies {
-			items = append(items, lib.movieItem(&movies[i]))
+		groups := append([]*embyMovieGroup{}, lib.movieGroups()...)
+		sort.SliceStable(groups, func(i, j int) bool {
+			return groups[i].latestCreatedAt().After(groups[j].latestCreatedAt())
+		})
+		for _, g := range groups {
+			items = append(items, lib.movieGroupItem(g))
 			if len(items) >= 50 {
 				break
 			}
@@ -1606,16 +1570,23 @@ func embyResume(c *gin.Context, lib *embyLibrary) {
 		return
 	}
 	var items []*embyItem
+	seen := map[string]bool{}
 	for _, row := range rows {
 		id := fmt.Sprintf("mv-%d", row.ItemID)
 		if row.EpisodeIndex > 0 {
 			id = lib.resumeEpisodeID(row.ItemID, row.EpisodeIndex)
 		}
 		if it, ok := lib.resolveItem(id); ok {
+			if seen[it.Id] {
+				continue
+			}
+			seen[it.Id] = true
 			if it.UserData == nil {
 				it.UserData = &embyUserData{}
 			}
-			it.UserData.PlaybackPositionTicks = row.PositionTicks
+			if it.UserData.PlaybackPositionTicks <= 0 {
+				it.UserData.PlaybackPositionTicks = row.PositionTicks
+			}
 			items = append(items, it)
 		}
 	}
@@ -1624,13 +1595,8 @@ func embyResume(c *gin.Context, lib *embyLibrary) {
 
 func embyItemCounts(c *gin.Context, user *model.User) {
 	lib := loadEmbyLibrary(user)
-	movies, series, episodes, songs, albums := 0, 0, 0, 0, 0
-	for i := range lib.videos {
-		if isEmbySeriesItem(&lib.videos[i]) {
-			continue
-		}
-		movies++
-	}
+	movies := len(lib.movieGroups())
+	series, episodes, songs, albums := 0, 0, 0, 0
 	for range lib.seriesList() {
 		series++
 	}

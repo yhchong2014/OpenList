@@ -96,6 +96,54 @@ AssertStaticBinary() {
   return 0
 }
 
+PatchWebMediaSettings() {
+  if ! command -v python3 >/dev/null 2>&1 || [ ! -d "public/dist/assets" ]; then
+    return 0
+  fi
+  python3 - <<'PY' || true
+import glob, re
+
+KEY = "media_date_added_follow_release"
+for path in glob.glob("public/dist/assets/*.js"):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+    except Exception:
+        continue
+    if "media_proxy_cover" not in src or KEY in src:
+        continue
+    out = src
+    # 1. MediaSettingsPage BASE_KEYS array
+    out = re.sub(
+        r'("media_subsonic_proxy_stream"\s*,\s*"media_proxy_cover")(\s*\])',
+        r'\1,"' + KEY + r'"\2',
+        out,
+    )
+    # 2. Locale bundles containing settings.media_proxy_cover
+    m = re.search(r'(?:"media_proxy_cover"|media_proxy_cover)\s*:\s*"([^"]*)"', out)
+    if m:
+        val = m.group(1)
+        is_zh = any("\u4e00" <= ch <= "\u9fff" for ch in val)
+        if is_zh:
+            label = "入库时间跟随发行日期"
+            tips = "开启后所有媒体的入库时间（Date Added）将同步为上映/发行日期（Release Date），对已有条目立即生效并在后续扫描、刮削、编辑、导入时持续保持。"
+        else:
+            label = "Sync Date Added to Release Date"
+            tips = "When enabled, Date Added (created_at) for all media items automatically follows Release Date — applied immediately to existing items and kept in sync on future scans, scrapes, edits, and imports."
+        inject = f'"{KEY}":"{label}","{KEY}-tips":"{tips}",'
+        out = re.sub(
+            r'((?:"media_proxy_cover"|media_proxy_cover)\s*:\s*"[^"]*")',
+            inject + r'\1',
+            out,
+            count=1,
+        )
+    if out != src:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(out)
+        print(f"Patched {KEY} into {path}")
+PY
+}
+
 FetchWebRolling() {
   pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/edge\"")
   pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
@@ -107,6 +155,7 @@ FetchWebRolling() {
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
+  PatchWebMediaSettings
 }
 
 FetchWebRelease() {
@@ -123,6 +172,7 @@ FetchWebRelease() {
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
+  PatchWebMediaSettings
 }
 
 BuildWinArm64() {

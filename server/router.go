@@ -275,6 +275,8 @@ func admin(g *gin.RouterGroup) {
 	mediaAdmin.POST("/appkey/delete", handles.DeleteMediaAppKey)
 	// STRM 批量生成
 	mediaAdmin.POST("/strm/generate", handles.GenerateMediaStrm)
+	// 入库时间跟随发行日期开关与全量同步
+	mediaAdmin.POST("/date_added_follow_release", handles.SetMediaDateAddedFollowReleaseAdmin)
 
 	// 转码管理
 	transcodeAdmin := g.Group("/transcode")
