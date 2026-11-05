@@ -122,14 +122,13 @@ func UpdateIndex() {
 		"Loading...":                           title,
 		"main_color: undefined":                fmt.Sprintf("main_color: '%s'", mainColor),
 	}
-	conf.ManageHtml = replaceStrings(conf.RawIndexHtml, replaceMap1)
+	conf.ManageHtml = injectManageMediaSettingsExt(replaceStrings(conf.RawIndexHtml, replaceMap1))
 	utils.Log.Debug("Applying replacements for manage pages...")
 	replaceMap2 := map[string]string{
 		"<!-- customize head -->": customizeHead,
 		"<!-- customize body -->": customizeBody,
 	}
-	conf.IndexHtml = replaceStrings(conf.ManageHtml, replaceMap2)
-	conf.ManageHtml = injectManageMediaSettingsExt(conf.ManageHtml)
+	conf.IndexHtml = injectManageMediaSettingsExt(replaceStrings(conf.ManageHtml, replaceMap2))
 	utils.Log.Debug("Index.html update completed")
 }
 

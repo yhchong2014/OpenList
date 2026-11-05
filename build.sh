@@ -100,47 +100,136 @@ PatchWebMediaSettings() {
   if ! command -v python3 >/dev/null 2>&1 || [ ! -d "public/dist/assets" ]; then
     return 0
   fi
-  python3 - <<'PY' || true
-import glob, re
+  python3 - <<'PY'
+import base64, glob, hashlib, json, os, re
+from collections import defaultdict
 
+ROOT = "public/dist"
+ASSETS = os.path.join(ROOT, "assets")
 KEY = "media_date_added_follow_release"
-for path in glob.glob("public/dist/assets/*.js"):
+
+def short_hash(s: str) -> str:
+    raw = hashlib.sha256(s.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")[:8]
+
+chunk_re = re.compile(r"(?:assets/|\./)([A-Za-z0-9_.-]{3,120}\.js)")
+js_paths = sorted(glob.glob(os.path.join(ASSETS, "*.js")))
+orig_existing = {os.path.basename(p) for p in js_paths}
+contents = {}
+file_refs = {}
+rev_deps = defaultdict(set)
+
+for p in js_paths:
+    base = os.path.basename(p)
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             src = f.read()
     except Exception:
         continue
+    contents[base] = src
+    refs = {r for r in chunk_re.findall(src) if r in orig_existing and r != base}
+    file_refs[base] = refs
+    for r in refs:
+        rev_deps[r].add(base)
+
+dirty = set()
+for base, src in list(contents.items()):
     if "media_proxy_cover" not in src or KEY in src:
         continue
     out = src
-    # 1. MediaSettingsPage BASE_KEYS array
-    out = re.sub(
-        r'("media_subsonic_proxy_stream"\s*,\s*"media_proxy_cover")(\s*\])',
-        r'\1,"' + KEY + r'"\2',
-        out,
-    )
-    # 2. Locale bundles containing settings.media_proxy_cover
-    m = re.search(r'(?:"media_proxy_cover"|media_proxy_cover)\s*:\s*"([^"]*)"', out)
-    if m:
-        val = m.group(1)
-        is_zh = any("\u4e00" <= ch <= "\u9fff" for ch in val)
-        if is_zh:
-            label = "入库时间跟随发行日期"
-            tips = "开启后所有媒体的入库时间（Date Added）将同步为上映/发行日期（Release Date），对已有条目立即生效并在后续扫描、刮削、编辑、导入时持续保持。"
-        else:
-            label = "Sync Date Added to Release Date"
-            tips = "When enabled, Date Added (created_at) for all media items automatically follows Release Date — applied immediately to existing items and kept in sync on future scans, scrapes, edits, and imports."
-        inject = f'"{KEY}":"{label}","{KEY}-tips":"{tips}",'
+    # 1. MediaSettingsPage BASE_KEYS array (supports ", ', and Rolldown `)
+    if "media_enabled" in out and "media_subsonic_proxy_stream" in out:
         out = re.sub(
-            r'((?:"media_proxy_cover"|media_proxy_cover)\s*:\s*"[^"]*")',
-            inject + r'\1',
+            r'((?:["\'`]media_enabled["\'`][^]]{0,400}?)([\"\'`])media_proxy_cover\2)',
+            r'\1,\2' + KEY + r'\2',
             out,
-            count=1,
         )
+    # 2. Locale bundles containing "media_proxy_cover-tips" (modern + legacy)
+    idx = out.find("media_proxy_cover-tips")
+    if idx > 0:
+        win = out[max(0, idx - 4) : idx + 600]
+        m = re.search(
+            r'(["\'`])media_proxy_cover-tips\1\s*:\s*(["\'`])((?:\\.|(?!\2)[\s\S]){1,500}?)\2',
+            win,
+        )
+        if m:
+            pos = max(0, idx - 4) + m.start()
+            tips_val = m.group(3)
+            has_cjk = bool(re.search(r"[\u4e00-\u9fff]", tips_val))
+            has_kana = bool(re.search(r"[\u3040-\u30ff]", tips_val))
+            if has_cjk and not has_kana:
+                if any(w in tips_val for w in ("透過", "圖片", "預設", "網域", "伺服器")):
+                    label = "入庫時間跟隨發行日期"
+                    tips = "開啟後所有媒體的入庫時間（Date Added）將同步為上映/發行日期（Release Date），對已有條目立即生效並在後續掃描、刮削、編輯、匯入時持續保持。"
+                else:
+                    label = "入库时间跟随发行日期"
+                    tips = "开启后所有媒体的入库时间（Date Added）将同步为上映/发行日期（Release Date），对已有条目立即生效并在后续扫描、刮削、编辑、导入时持续保持。"
+            else:
+                label = "Sync Date Added to Release Date"
+                tips = "When enabled, Date Added (created_at) for all media items automatically follows Release Date — applied immediately to existing items and kept in sync on future scans, scrapes, edits, and imports."
+            inject = (
+                f'{json.dumps(KEY)}:{json.dumps(label, ensure_ascii=False)},'
+                f'{json.dumps(KEY + "-tips")}:{json.dumps(tips, ensure_ascii=False)},'
+            )
+            out = out[:pos] + inject + out[pos:]
     if out != src:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(out)
-        print(f"Patched {KEY} into {path}")
+        contents[base] = out
+        dirty.add(base)
+
+if not dirty:
+    raise SystemExit(0)
+
+# Re-hash modified chunks and transitive importers so long-lived /assets/* caches bust cleanly
+queue = list(dirty)
+affected = set(dirty)
+while queue:
+    cur = queue.pop()
+    for imp in rev_deps.get(cur, ()):
+        if imp not in affected:
+            affected.add(imp)
+            queue.append(imp)
+
+stamp = short_hash("|".join(f"{b}:{short_hash(contents[b])}" for b in sorted(dirty)))
+rename_map = {}
+for base in sorted(affected):
+    hm = re.match(r"^(.+-)([A-Za-z0-9_-]{8})(\.js)$", base)
+    if hm:
+        new_base = f"{hm.group(1)}{short_hash(base + ':' + stamp)}{hm.group(3)}"
+        if new_base != base:
+            rename_map[base] = new_base
+
+for base in affected:
+    s = contents[base]
+    for old_b in file_refs.get(base, ()):
+        if old_b in rename_map:
+            s = s.replace(old_b, rename_map[old_b])
+    contents[base] = s
+
+if rename_map:
+    for html_path in sorted(glob.glob(os.path.join(ROOT, "*.html"))):
+        try:
+            with open(html_path, "r", encoding="utf-8") as f:
+                hsrc = f.read()
+        except Exception:
+            continue
+        hout = hsrc
+        for old_b in set(chunk_re.findall(hsrc)):
+            if old_b in rename_map:
+                hout = hout.replace(old_b, rename_map[old_b])
+        if hout != hsrc:
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(hout)
+
+for base in affected:
+    new_base = rename_map.get(base, base)
+    old_path = os.path.join(ASSETS, base)
+    new_path = os.path.join(ASSETS, new_base)
+    with open(new_path, "w", encoding="utf-8") as f:
+        f.write(contents[base])
+    if new_path != old_path and os.path.exists(old_path):
+        os.remove(old_path)
+
+print(f"Patched {KEY} into {len(dirty)} frontend chunks ({len(affected)} rehashed)")
 PY
 }
 
