@@ -129,6 +129,7 @@ func UpdateIndex() {
 		"<!-- customize body -->": customizeBody,
 	}
 	conf.IndexHtml = replaceStrings(conf.ManageHtml, replaceMap2)
+	conf.ManageHtml = injectManageMediaSettingsExt(conf.ManageHtml)
 	utils.Log.Debug("Index.html update completed")
 }
 

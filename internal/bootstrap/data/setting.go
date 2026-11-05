@@ -296,6 +296,8 @@ func InitialSettings() []model.SettingItem {
 			Help: `开启后由服务端代理 TMDB/豆瓣等外部封面图片，适合直连图片域名受限的网络；默认关闭，直接使用原始图片地址`},
 		{Key: conf.MediaCoverGateway, Value: "false", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,
 			Help: `封面代理直连失败时，回退到第三方图片网关 wsrv.nl 重试。开启后封面地址会发送给该第三方服务；默认关闭`},
+		{Key: conf.MediaDateAddedFollowRelease, Value: "false", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,
+			Help: `开启后所有媒体的入库时间（Date Added / created_at）将自动同步为上映/发行日期（release_date），对已有条目立即生效并在后续扫描、刮削、编辑、导入时持续保持`},
 		{Key: conf.MediaStrmOnScan, Value: "false", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,
 			Help: `扫描完成后自动把媒体条目生成为 .strm 文件并写入下方目录`},
 		{Key: conf.MediaStrmOverwrite, Value: "true", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,

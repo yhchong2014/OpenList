@@ -19,6 +19,7 @@ const MediaMigrateWipeEnv = "OPENLIST_MEDIA_MIGRATE_WIPE"
 
 func Init(d *gorm.DB) {
 	db = d
+	resetMediaDateAddedFollowReleaseCache()
 	if err := migrateMediaItems(); err != nil {
 		log.Fatalf("failed migrate media_items: %s (如果旧数据无法原地迁移，请先备份数据库，再设置 %s=1 重建媒体表)", err.Error(), MediaMigrateWipeEnv)
 	}

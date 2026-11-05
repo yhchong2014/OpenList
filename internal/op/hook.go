@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -94,6 +95,21 @@ var settingItemHooks = map[string]SettingItemHook{
 			return fmt.Errorf("multipart chunk size must be a positive integer (MB), got %q", item.Value)
 		}
 		item.Value = strconv.Itoa(size)
+		return nil
+	},
+	conf.MediaDateAddedFollowRelease: func(item *model.SettingItem) error {
+		enabled := item.Value == "true" || item.Value == "1"
+		db.SetMediaDateAddedFollowRelease(enabled)
+		if enabled {
+			updated, err := db.SyncAllMediaCreatedAtToReleaseDate()
+			if err != nil {
+				log.Warnf("[media] sync created_at to release_date failed: %v", err)
+				return err
+			}
+			if updated > 0 {
+				log.Infof("[media] synced created_at to release_date for %d items", updated)
+			}
+		}
 		return nil
 	},
 }

@@ -211,6 +211,7 @@ func CreateOrUpdateMediaItem(item *model.MediaItem) error {
 	var existing model.MediaItem
 	result := db.Unscoped().Where("folder_path = ? AND file_name = ? AND album_name = ?", item.FolderPath, item.FileName, item.AlbumName).First(&existing)
 	if result.Error == gorm.ErrRecordNotFound {
+		applyReleaseDateToCreatedAt(item)
 		return db.Create(item).Error
 	}
 	if result.Error != nil {
@@ -249,12 +250,14 @@ func CreateOrUpdateMediaItem(item *model.MediaItem) error {
 	}
 	// 扫描不覆盖用户手动隐藏的状态
 	item.Hidden = existing.Hidden
+	applyReleaseDateToCreatedAt(item)
 	return db.Unscoped().Save(item).Error
 }
 
 // UpdateMediaItem 更新媒体条目
 // 使用 Unscoped 确保即使存在软删除标记也能正确更新（避免命中唯一索引但行不可见的诡异情况）。
 func UpdateMediaItem(item *model.MediaItem) error {
+	applyReleaseDateToCreatedAt(item)
 	return db.Unscoped().Save(item).Error
 }
 
@@ -272,6 +275,7 @@ func UpdateMediaItems(items []model.MediaItem) error {
 	}
 	return db.Transaction(func(tx *gorm.DB) error {
 		for i := range items {
+			applyReleaseDateToCreatedAt(&items[i])
 			if err := tx.Unscoped().Save(&items[i]).Error; err != nil {
 				return err
 			}
@@ -861,6 +865,7 @@ func ImportMediaItems(items []model.MediaItem, scanPathIDOverride *uint) (create
 			it.FolderPath, it.FileName, it.AlbumName,
 		).First(&existing)
 		if result.Error == gorm.ErrRecordNotFound {
+			applyReleaseDateToCreatedAt(&it)
 			if e := db.Create(&it).Error; e != nil {
 				return created, updated, e
 			}
@@ -874,6 +879,7 @@ func ImportMediaItems(items []model.MediaItem, scanPathIDOverride *uint) (create
 		it.ID = existing.ID
 		it.CreatedAt = existing.CreatedAt
 		it.DeletedAt = gorm.DeletedAt{}
+		applyReleaseDateToCreatedAt(&it)
 		if e := db.Unscoped().Save(&it).Error; e != nil {
 			return created, updated, e
 		}
