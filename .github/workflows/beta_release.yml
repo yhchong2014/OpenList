@@ -62,6 +62,7 @@ jobs:
     needs:
       - changelog
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: "!(*musl*|*windows-arm64*|*windows7-*|*android*|*freebsd*)" # xgo and loongarch (exclude mips64le)

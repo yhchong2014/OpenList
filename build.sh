@@ -11,6 +11,7 @@ githubAuthArgs=""
 if [ -n "$GITHUB_TOKEN" ]; then
   githubAuthArgs="--header \"Authorization: Bearer $GITHUB_TOKEN\""
 fi
+curlRetryArgs="--retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 15"
 
 # Check for lite parameter
 useLite=false
@@ -18,6 +19,7 @@ if [[ "$*" == *"lite"* ]]; then
   useLite=true
 fi
 
+_frontendReleaseJson=""
 if [ "$1" = "dev" ]; then
   version="dev"
   webVersion="rolling"
@@ -28,7 +30,10 @@ else
   git tag -d beta || true
   # Always true if there's no tag
   version=$(git describe --abbrev=0 --tags 2>/dev/null || echo "v0.0.0")
-  webVersion=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/$frontendRepo/releases/latest\"" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+  if [ "$1" != "zip" ] && [ "$1" != "prepare" ]; then
+    _frontendReleaseJson=$(eval "curl -fsSL $curlRetryArgs --max-time 30 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
+    webVersion=$(echo "$_frontendReleaseJson" | grep '"tag_name"' | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+  fi
 fi
 
 echo "backend version: $version"
@@ -234,13 +239,13 @@ PY
 }
 
 FetchWebRolling() {
-  pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/edge\"")
+  pre_release_json=$(eval "curl -fsSL $curlRetryArgs --max-time 30 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/edge\"")
   pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
   
   # There is no lite for rolling
   pre_release_tar_url=$(echo "$pre_release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
 
-  curl -fsSL "$pre_release_tar_url" -o dist.tar.gz
+  curl -fsSL $curlRetryArgs --max-time 300 "$pre_release_tar_url" -o dist.tar.gz
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
@@ -248,7 +253,11 @@ FetchWebRolling() {
 }
 
 FetchWebRelease() {
-  release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
+  if [ -n "$_frontendReleaseJson" ]; then
+    release_json="$_frontendReleaseJson"
+  else
+    release_json=$(eval "curl -fsSL $curlRetryArgs --max-time 30 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
+  fi
   release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
   
   if [ "$useLite" = true ]; then
@@ -257,7 +266,7 @@ FetchWebRelease() {
     release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
   fi
   
-  curl -fsSL "$release_tar_url" -o dist.tar.gz
+  curl -fsSL $curlRetryArgs --max-time 300 "$release_tar_url" -o dist.tar.gz
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
@@ -323,7 +332,7 @@ BuildDev() {
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross)
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
-    curl -fsSL -o "${i}.tgz" "${url}"
+    curl -fsSL $curlRetryArgs -o "${i}.tgz" "${url}"
     sudo tar xf "${i}.tgz" --strip-components 1 -C /usr/local
   done
   OS_ARCHES=(linux-musl-amd64 linux-musl-arm64)
@@ -359,7 +368,7 @@ PrepareBuildDockerMusl() {
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
     lib_tgz="build/${i}.tgz"
-    curl -fsSL -o "${lib_tgz}" "${url}"
+    curl -fsSL $curlRetryArgs -o "${lib_tgz}" "${url}"
     tar xf "${lib_tgz}" --strip-components 1 -C build/musl-libs
     rm -f "${lib_tgz}"
   done
@@ -586,7 +595,7 @@ BuildReleaseLinuxMusl() {
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross mips-linux-musl-cross mips64-linux-musl-cross mips64el-linux-musl-cross mipsel-linux-musl-cross powerpc64le-linux-musl-cross s390x-linux-musl-cross loongarch64-linux-musl-cross)
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
-    curl -fsSL -o "${i}.tgz" "${url}"
+    curl -fsSL $curlRetryArgs -o "${i}.tgz" "${url}"
     sudo tar xf "${i}.tgz" --strip-components 1 -C /usr/local
     rm -f "${i}.tgz"
   done
@@ -613,7 +622,7 @@ BuildReleaseLinuxMuslArm() {
   FILES=(arm-linux-musleabi-cross arm-linux-musleabihf-cross armel-linux-musleabi-cross armel-linux-musleabihf-cross armv5l-linux-musleabi-cross armv5l-linux-musleabihf-cross armv6-linux-musleabi-cross armv6-linux-musleabihf-cross armv7l-linux-musleabihf-cross armv7m-linux-musleabi-cross armv7r-linux-musleabihf-cross)
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
-    curl -fsSL -o "${i}.tgz" "${url}"
+    curl -fsSL $curlRetryArgs -o "${i}.tgz" "${url}"
     sudo tar xf "${i}.tgz" --strip-components 1 -C /usr/local
     rm -f "${i}.tgz"
   done
@@ -660,14 +669,14 @@ BuildReleaseFreeBSD() {
   mkdir -p "build/freebsd"
   
   # Get latest FreeBSD 14.x release version from GitHub 
-  freebsd_version=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/freebsd/freebsd-src/tags\"" | \
+  freebsd_version=$(eval "curl -fsSL $curlRetryArgs --max-time 30 $githubAuthArgs \"https://api.github.com/repos/freebsd/freebsd-src/tags\"" | \
     jq -r '.[].name' | \
     grep '^release/14\.' | \
     grep -v -- '-p[0-9]*$' | \
     sort -V | \
     tail -1 | \
     sed 's/release\///' | \
-    sed 's/\.0$//')
+    sed 's/\.0$//' || true)
   
   if [ -z "$freebsd_version" ]; then
     echo "Failed to get FreeBSD version, falling back to 14.4"
