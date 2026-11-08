@@ -24,6 +24,7 @@ jobs:
   release:
     needs: prerelease
     strategy:
+      fail-fast: false
       matrix:
         build-type: [ 'standard', 'lite' ]
         target-platform: [ '', 'android', 'freebsd', 'linux_musl', 'linux_musl_arm' ]
