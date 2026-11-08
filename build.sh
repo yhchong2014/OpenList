@@ -238,14 +238,64 @@ print(f"Patched {KEY} into {len(dirty)} frontend chunks ({len(affected)} rehashe
 PY
 }
 
+_ghReleaseCacheDir=""
+DownloadGitHubReleaseAsset() {
+  local repo="$1"
+  local tag="$2"
+  local asset_name="$3"
+  local out_file="$4"
+
+  if [ -z "$_ghReleaseCacheDir" ] || [ ! -d "$_ghReleaseCacheDir" ]; then
+    _ghReleaseCacheDir=$(mktemp -d)
+  fi
+  local cache_key
+  cache_key=$(echo "${repo}_${tag}" | tr '/:' '__')
+  local cache_file="$_ghReleaseCacheDir/${cache_key}.json"
+
+  if [ ! -s "$cache_file" ]; then
+    local api_ep
+    if [ "$tag" = "latest" ]; then
+      api_ep="https://api.github.com/repos/${repo}/releases/latest"
+    else
+      api_ep="https://api.github.com/repos/${repo}/releases/tags/${tag}"
+    fi
+    eval "curl -fsSL $curlRetryArgs --max-time 30 $githubAuthArgs -H \"Accept: application/vnd.github+json\" \"$api_ep\"" > "$cache_file" || rm -f "$cache_file"
+  fi
+
+  local asset_api_url=""
+  if [ -s "$cache_file" ]; then
+    asset_api_url=$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .url' "$cache_file" | head -n 1)
+  fi
+
+  # Download via REST API asset endpoint (returns 302 directly to release-assets.githubusercontent.com,
+  # bypassing github.com/.../releases/download/ web gateway 504s)
+  if [ -n "$asset_api_url" ] && [ "$asset_api_url" != "null" ]; then
+    if eval "curl -fsSL $curlRetryArgs --max-time 600 $githubAuthArgs -H \"Accept: application/octet-stream\" \"$asset_api_url\" -o \"$out_file\""; then
+      return 0
+    fi
+  fi
+
+  local web_url
+  if [ "$tag" = "latest" ]; then
+    web_url="https://github.com/${repo}/releases/latest/download/${asset_name}"
+  else
+    web_url="https://github.com/${repo}/releases/download/${tag}/${asset_name}"
+  fi
+  curl -fsSL $curlRetryArgs --max-time 600 "$web_url" -o "$out_file"
+}
+
 FetchWebRolling() {
   pre_release_json=$(eval "curl -fsSL $curlRetryArgs --max-time 30 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/edge\"")
-  pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
   
-  # There is no lite for rolling
-  pre_release_tar_url=$(echo "$pre_release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+  # Prefer REST API asset .url (Accept: application/octet-stream) to bypass github.com web download 504s
+  pre_release_api_url=$(echo "$pre_release_json" | jq -r '.assets[] | select((.name | contains("openlist-frontend-dist")) and (.name | contains("lite") | not) and (.name | endswith(".tar.gz"))) | .url' | head -n 1)
+  if [ -n "$pre_release_api_url" ] && [ "$pre_release_api_url" != "null" ]; then
+    eval "curl -fsSL $curlRetryArgs --max-time 300 $githubAuthArgs -H \"Accept: application/octet-stream\" \"$pre_release_api_url\" -o dist.tar.gz"
+  else
+    pre_release_tar_url=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url' | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+    curl -fsSL $curlRetryArgs --max-time 300 "$pre_release_tar_url" -o dist.tar.gz
+  fi
 
-  curl -fsSL $curlRetryArgs --max-time 300 "$pre_release_tar_url" -o dist.tar.gz
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
@@ -258,15 +308,25 @@ FetchWebRelease() {
   else
     release_json=$(eval "curl -fsSL $curlRetryArgs --max-time 30 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
   fi
-  release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
   
   if [ "$useLite" = true ]; then
-    release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist-lite" | grep "\.tar\.gz$")
+    release_api_url=$(echo "$release_json" | jq -r '.assets[] | select((.name | contains("openlist-frontend-dist-lite")) and (.name | endswith(".tar.gz"))) | .url' | head -n 1)
   else
-    release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+    release_api_url=$(echo "$release_json" | jq -r '.assets[] | select((.name | contains("openlist-frontend-dist")) and (.name | contains("lite") | not) and (.name | endswith(".tar.gz"))) | .url' | head -n 1)
   fi
-  
-  curl -fsSL $curlRetryArgs --max-time 300 "$release_tar_url" -o dist.tar.gz
+
+  if [ -n "$release_api_url" ] && [ "$release_api_url" != "null" ]; then
+    eval "curl -fsSL $curlRetryArgs --max-time 300 $githubAuthArgs -H \"Accept: application/octet-stream\" \"$release_api_url\" -o dist.tar.gz"
+  else
+    release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
+    if [ "$useLite" = true ]; then
+      release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist-lite" | grep "\.tar\.gz$")
+    else
+      release_tar_url=$(echo "$release_assets" | grep "openlist-frontend-dist" | grep -v "lite" | grep "\.tar\.gz$")
+    fi
+    curl -fsSL $curlRetryArgs --max-time 300 "$release_tar_url" -o dist.tar.gz
+  fi
+
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
@@ -290,8 +350,7 @@ BuildWin7() {
   go_version=$(go version | grep -o 'go[0-9]\+\.[0-9]\+\.[0-9]\+' | sed 's/go//')
   echo "Detected Go version: $go_version"
   
-  curl -fsSL --retry 3 -o go-win7.zip -H "Authorization: Bearer $GITHUB_TOKEN" \
-    "https://github.com/XTLS/go-win7/releases/download/patched-${go_version}/go-for-win7-linux-amd64.zip"
+  DownloadGitHubReleaseAsset "XTLS/go-win7" "patched-${go_version}" "go-for-win7-linux-amd64.zip" "go-win7.zip"
   
   rm -rf go-win7
   unzip go-win7.zip -d go-win7
@@ -328,11 +387,9 @@ BuildWin7() {
 BuildDev() {
   mkdir -p "dist"
   muslflags="$(GetMuslStaticLdflags)"
-  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross)
   for i in "${FILES[@]}"; do
-    url="${BASE}${i}.tgz"
-    curl -fsSL $curlRetryArgs -o "${i}.tgz" "${url}"
+    DownloadGitHubReleaseAsset "OpenListTeam/musl-compilers" "latest" "${i}.tgz" "${i}.tgz"
     sudo tar xf "${i}.tgz" --strip-components 1 -C /usr/local
   done
   OS_ARCHES=(linux-musl-amd64 linux-musl-arm64)
@@ -363,12 +420,10 @@ BuildDocker() {
 
 PrepareBuildDockerMusl() {
   mkdir -p build/musl-libs
-  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross i486-linux-musl-cross armv6-linux-musleabihf-cross armv7l-linux-musleabihf-cross riscv64-linux-musl-cross powerpc64le-linux-musl-cross loongarch64-linux-musl-cross) ## Disable s390x-linux-musl-cross builds
   for i in "${FILES[@]}"; do
-    url="${BASE}${i}.tgz"
     lib_tgz="build/${i}.tgz"
-    curl -fsSL $curlRetryArgs -o "${lib_tgz}" "${url}"
+    DownloadGitHubReleaseAsset "OpenListTeam/musl-compilers" "latest" "${i}.tgz" "${lib_tgz}"
     tar xf "${lib_tgz}" --strip-components 1 -C build/musl-libs
     rm -f "${lib_tgz}"
   done
@@ -454,16 +509,8 @@ BuildLoongGLIBC() {
     echo "Setting up Loongson old-world ABI1.0 toolchain and patched Go compiler..."
     
     # Download and setup patched Go compiler for old-world
-    if ! curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
-      "https://github.com/loong64-abi1-0/golang/releases/download/go${oldWorldGoVersion}/go${oldWorldGoVersion}.linux-amd64.tar.gz" \
-      -o go-loong64-abi1.0.tar.gz; then
+    if ! DownloadGitHubReleaseAsset "loong64-abi1-0/golang" "go${oldWorldGoVersion}" "go${oldWorldGoVersion}.linux-amd64.tar.gz" "go-loong64-abi1.0.tar.gz"; then
       echo "Error: Failed to download patched Go compiler for old-world ABI1.0"
-      if [ -n "$GITHUB_TOKEN" ]; then
-        echo "Error output from curl:"
-        curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
-          "https://github.com/loong64-abi1-0/golang/releases/download/go${oldWorldGoVersion}/go${oldWorldGoVersion}.linux-amd64.tar.gz" \
-          -o go-loong64-abi1.0.tar.gz || true
-      fi
       return 1
     fi
     
@@ -476,16 +523,8 @@ BuildLoongGLIBC() {
     rm go-loong64-abi1.0.tar.gz
     
     # Download and setup GCC toolchain for old-world
-    if ! curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
-      "https://github.com/loong64/loong64-abi1.0-toolchains/releases/download/20250722/loongson-gnu-toolchain-8.3.novec-x86_64-loongarch64-linux-gnu-rc1.1.tar.xz" \
-      -o gcc8-loong64-abi1.0.tar.xz; then
+    if ! DownloadGitHubReleaseAsset "loong64/loong64-abi1.0-toolchains" "20250722" "loongson-gnu-toolchain-8.3.novec-x86_64-loongarch64-linux-gnu-rc1.1.tar.xz" "gcc8-loong64-abi1.0.tar.xz"; then
       echo "Error: Failed to download GCC toolchain for old-world ABI1.0"
-      if [ -n "$GITHUB_TOKEN" ]; then
-        echo "Error output from curl:"
-        curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
-          "https://github.com/loong64/loong64-abi1.0-toolchains/releases/download/20250722/loongson-gnu-toolchain-8.3.novec-x86_64-loongarch64-linux-gnu-rc1.1.tar.xz" \
-          -o gcc8-loong64-abi1.0.tar.xz || true
-      fi
       return 1
     fi
     
@@ -538,16 +577,8 @@ BuildLoongGLIBC() {
   else
     # Setup abi2.0 toolchain for new world glibc build
     echo "Setting up new-world ABI2.0 toolchain..."
-    if ! curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
-      "https://github.com/loong64/cross-tools/releases/download/20250507/x86_64-cross-tools-loongarch64-unknown-linux-gnu-legacy.tar.xz" \
-      -o gcc12-loong64-abi2.0.tar.xz; then
+    if ! DownloadGitHubReleaseAsset "loong64/cross-tools" "20250507" "x86_64-cross-tools-loongarch64-unknown-linux-gnu-legacy.tar.xz" "gcc12-loong64-abi2.0.tar.xz"; then
       echo "Error: Failed to download GCC toolchain for new-world ABI2.0"
-      if [ -n "$GITHUB_TOKEN" ]; then
-        echo "Error output from curl:"
-        curl -fsSL --retry 3 -H "Authorization: Bearer $GITHUB_TOKEN" \
-          "https://github.com/loong64/cross-tools/releases/download/20250507/x86_64-cross-tools-loongarch64-unknown-linux-gnu-legacy.tar.xz" \
-          -o gcc12-loong64-abi2.0.tar.xz || true
-      fi
       return 1
     fi
     
@@ -590,12 +621,10 @@ BuildLoongGLIBC() {
 BuildReleaseLinuxMusl() {
   mkdir -p "build"
   muslflags="$(GetMuslStaticLdflags)"
-  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
   # Keep mips-family targets enabled; sqlite driver selection is handled by Go build tags.
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross mips-linux-musl-cross mips64-linux-musl-cross mips64el-linux-musl-cross mipsel-linux-musl-cross powerpc64le-linux-musl-cross s390x-linux-musl-cross loongarch64-linux-musl-cross)
   for i in "${FILES[@]}"; do
-    url="${BASE}${i}.tgz"
-    curl -fsSL $curlRetryArgs -o "${i}.tgz" "${url}"
+    DownloadGitHubReleaseAsset "OpenListTeam/musl-compilers" "latest" "${i}.tgz" "${i}.tgz"
     sudo tar xf "${i}.tgz" --strip-components 1 -C /usr/local
     rm -f "${i}.tgz"
   done
@@ -618,11 +647,9 @@ BuildReleaseLinuxMusl() {
 BuildReleaseLinuxMuslArm() {
   mkdir -p "build"
   muslflags="$(GetMuslStaticLdflags)"
-  BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
   FILES=(arm-linux-musleabi-cross arm-linux-musleabihf-cross armel-linux-musleabi-cross armel-linux-musleabihf-cross armv5l-linux-musleabi-cross armv5l-linux-musleabihf-cross armv6-linux-musleabi-cross armv6-linux-musleabihf-cross armv7l-linux-musleabihf-cross armv7m-linux-musleabi-cross armv7r-linux-musleabihf-cross)
   for i in "${FILES[@]}"; do
-    url="${BASE}${i}.tgz"
-    curl -fsSL $curlRetryArgs -o "${i}.tgz" "${url}"
+    DownloadGitHubReleaseAsset "OpenListTeam/musl-compilers" "latest" "${i}.tgz" "${i}.tgz"
     sudo tar xf "${i}.tgz" --strip-components 1 -C /usr/local
     rm -f "${i}.tgz"
   done
@@ -647,7 +674,7 @@ BuildReleaseLinuxMuslArm() {
 
 BuildReleaseAndroid() {
   mkdir -p "build"
-  wget https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
+  wget --tries=5 --waitretry=3 https://dl.google.com/android/repository/android-ndk-r26b-linux.zip
   unzip android-ndk-r26b-linux.zip
   rm android-ndk-r26b-linux.zip
   OS_ARCHES=(amd64 arm64 386 arm)
@@ -693,7 +720,7 @@ BuildReleaseFreeBSD() {
     cgo_cc="clang --target=${CGO_ARGS[$i]} --sysroot=/opt/freebsd/${os_arch}"
     echo building for freebsd-${os_arch}
     sudo mkdir -p "/opt/freebsd/${os_arch}"
-    wget -q https://download.freebsd.org/releases/${os_arch}/${freebsd_version}-RELEASE/base.txz
+    wget -q --tries=5 --waitretry=3 https://download.freebsd.org/releases/${os_arch}/${freebsd_version}-RELEASE/base.txz
     sudo tar -xf ./base.txz -C /opt/freebsd/${os_arch}
     rm base.txz
     export GOOS=freebsd
